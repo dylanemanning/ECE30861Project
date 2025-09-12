@@ -1,0 +1,47 @@
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def check_license(repo_url):
+    # Extract the owner and repo name from the URL
+    owner, repo = repo_url.rstrip('/').split('/')[-2:]
+
+    # GitHub API URL to fetch repository details
+    api_url = f"https://api.github.com/repos/{owner}/{repo}"
+
+    try:
+        response = requests.get(api_url)
+        response.raise_for_status()
+        data = response.json()
+
+        license_info = data.get('license')
+        if license_info and license_info.get('spdx_id') == 'LGPL-2.1':
+            return (repo_url, True)
+        elif license_info:
+            return (repo_url, False)
+        else:
+            return (repo_url, "No license info found")
+    except requests.exceptions.RequestException as e:
+        return (repo_url, f"Error: {e}")
+
+# List of repositories to evaluate
+repos = [
+    "https://github.com/urcu/userspace-rcu",
+    "https://github.com/copperspice/copperspice",
+    "https://github.com/CCMS-UCSD/ProteoSAFe",
+    "https://github.com/liberapay/liberapay.com",
+    "https://github.com/zephyrproject-rtos/zephyr",
+    "https://github.com/python/mypy"
+]
+
+# Run license checks concurrently
+with ThreadPoolExecutor(max_workers=6) as executor:
+    future_to_repo = {executor.submit(check_license, repo): repo for repo in repos}
+
+    for future in as_completed(future_to_repo):
+        repo_url, result = future.result()
+        if result is True:
+            print(f"{repo_url} is licensed under LGPLv2.1.")
+        elif result is False:
+            print(f"{repo_url} does NOT have a valid LGPLv2.1 license.")
+        else:
+            print(f"{repo_url} failed to check: {result}")
