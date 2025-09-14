@@ -1,1 +1,21 @@
+#register autograder
+curl --location 'http://dl-berlin.ecn.purdue.edu/api/register' \
+--header 'Content-Type: application/json' \
+--data '{
+    "group": your_group_number,
+    "github": "link_to_your_github_repo",
+    "names": [
+            "John Doe",
+            ..a list of names of your team members
+    ],
+    "gh_token": "your_github_token"
+}'
 
+
+#schedule run
+curl --location 'http://dl-berlin.ecn.purdue.edu/api/schedule' \
+--header 'Content-Type: application/json' \
+--data '{
+    "group": your_group_number,
+    "gh_token": "your_github_token"
+}'
