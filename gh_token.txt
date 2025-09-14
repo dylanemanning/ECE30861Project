@@ -2,11 +2,13 @@
 curl --location 'http://dl-berlin.ecn.purdue.edu/api/register' \
 --header 'Content-Type: application/json' \
 --data '{
-    "group": your_group_number,
+    "group": 13,
     "github": "link_to_your_github_repo",
     "names": [
-            "John Doe",
-            ..a list of names of your team members
+            "Dylan Manning", 
+            "Cecilia Jiang", 
+            "Tianyu Zhang", 
+            "Ava Lyall ",
     ],
     "gh_token": "your_github_token"
 }'
@@ -16,6 +18,6 @@ curl --location 'http://dl-berlin.ecn.purdue.edu/api/register' \
 curl --location 'http://dl-berlin.ecn.purdue.edu/api/schedule' \
 --header 'Content-Type: application/json' \
 --data '{
-    "group": your_group_number,
+    "group": 13,
     "gh_token": "your_github_token"
 }'
