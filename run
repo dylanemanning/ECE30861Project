@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Top-level runner script.
+
+Usage:
+  ./run install   # installs requirements with pip --user
+  ./run test      # runs pytest with coverage and prints summary
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import subprocess
+import sys
+from typing import Iterable, Tuple
+
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def run_install() -> int:
+    req = os.path.join(ROOT, "requirements.txt")
+    if not os.path.exists(req):
+        print("requirements.txt not found", file=sys.stderr)
+        return 1
+    cmd = [sys.executable, "-m", "pip", "install", "--user", "-r", req]
+    print("Installing requirements:", " ".join(shlex.quote(c) for c in cmd))
+    proc = subprocess.run(cmd)
+    return 0 if proc.returncode == 0 else 1
+
+
+def parse_pytest_output(text: str) -> Tuple[int, int, float]:
+    passed = 0
+    total = 0
+    cov = 0.0
+    m = re.search(r"==\s*(\d+) passed", text)
+    if m:
+        passed = int(m.group(1))
+        total = passed
+    else:
+        m2 = re.search(r"(\d+) passed.*?(\d+) failed", text, re.S)
+        if m2:
+            passed = int(m2.group(1))
+            total = passed + int(m2.group(2))
+    m3 = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", text)
+    if m3:
+        cov = float(m3.group(1))
+    else:
+        m4 = re.search(r"\b(\d+)%\s*covered", text)
+        if m4:
+            cov = float(m4.group(1))
+    return passed, total, cov
+
+
+def run_tests() -> int:
+    cmd = [sys.executable, "-m", "pytest", "-q", "--disable-warnings", "--maxfail=1", "--cov=src", "--cov-report=term"]
+    print("Running tests:", " ".join(shlex.quote(c) for c in cmd))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    output = proc.stdout or ""
+    print(output)
+    passed, total, cov = parse_pytest_output(output)
+    if total == 0:
+        # fallback: if pytest succeeded, assume all tests passed
+        if proc.returncode == 0:
+            total = passed
+        else:
+            # try to infer from output numbers
+            m = re.search(r"(\d+) failed", output)
+            if m:
+                total = int(m.group(1)) + passed
+            else:
+                total = max(passed, 0)
+    print(f"{passed}/{total} test cases passed. {cov:.0f}% line coverage achieved")
+    return 0 if proc.returncode == 0 else 1
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="run")
+    parser.add_argument("command", choices=("install", "test"))
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.command == "install":
+        return run_install()
+    if args.command == "test":
+        return run_tests()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
