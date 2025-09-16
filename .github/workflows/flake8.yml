@@ -1,0 +1,69 @@
+name: Flake8 Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  flake8:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run flake8 and save report
+        run: |
+          mkdir -p report
+          # Run flake8 and write deterministic output file
+          flake8 --format=default . > report/flake8.txt || true
+        continue-on-error: true
+
+      - name: Save flake8 report to artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake8-report
+          path: report/
+
+  run-tests:
+    runs-on: ubuntu-latest
+    needs: flake8
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run project tests via ./run test
+        run: |
+          mkdir -p test-output
+          # Run the run helper script and capture stdout/stderr
+          ./run test > test-output/run-test.txt 2>&1 || true
+        continue-on-error: true
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-test-output
+          path: test-output/
