@@ -1,6 +1,7 @@
 import os
 import tempfile
 import shutil
+import requests  # For GitHub API license lookup
 # Import the Repo class from GitPython to interact with git repositories
 from git import Repo  # pip install GitPython
 
@@ -92,26 +93,36 @@ def analyze_repo(repo_url: str) -> dict:
     compatible_licenses = [
         "LGPL-2.1",
         "LGPL-2.1-only",
-        "LGPL-2.1-or-later",
-        "GPL-2.0",
-        "GPL-3.0",
-        "MIT",
-        "BSD-2-Clause",
-        "BSD-3-Clause",
-        "Apache-2.0"
+        "LGPL-2.1-or-later"
     ]
+    # Parse owner/repo from the URL for GitHub API
     try:
+        parts = repo_url.rstrip('/').split('/')
+        owner, repo_name = parts[-2], parts[-1]
+        api_url = f"https://api.github.com/repos/{owner}/{repo_name}"
+        license_type = "Unknown"
+        # Try to get license info from GitHub API
+        try:
+            resp = requests.get(api_url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("license") and data["license"].get("spdx_id"):
+                    license_type = data["license"]["spdx_id"]
+        except Exception:
+            pass
+
         # Clone the repo into the temp directory
         clone_repo(repo_url, temp_dir)
-        # Extract the license type from the repo
-        license_type = extract_license(temp_dir)
+        # If license_type is still unknown, try to extract from files
+        if license_type == "Unknown":
+            license_type = extract_license(temp_dir)
         # Gather statistics about the repo's files
         stats = extract_repo_stats(temp_dir)
 
         # Build and return the result dictionary
         return {
             # Get the last two parts of the repo URL for identification
-            "repo": repo_url.split("/")[-2:] if repo_url else "Unknown",
+            "repo": [owner, repo_name],
             "license": license_type,
             **stats,
             # Check if the detected license is in the compatible list
@@ -124,7 +135,7 @@ def analyze_repo(repo_url: str) -> dict:
 
 if __name__ == "__main__":
     # Example usage: analyze a public GitHub repository
-    test_repo = "https://github.com/copperspice/copperspice"
+    test_repo = "https://github.com/torvalds/linux"
     # Call analyze_repo to get metadata and stats for the repo
     info = analyze_repo(test_repo)
     # Print the results to the console
