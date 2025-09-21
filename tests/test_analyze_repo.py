@@ -6,7 +6,7 @@ from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 # Import the functions we're testing
-from analyze_repo import (
+from src.analyze_repo import (
     clone_repo,
     extract_license,
     extract_repo_stats,

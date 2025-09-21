@@ -6,7 +6,7 @@ from unittest.mock import patch, Mock, MagicMock
 import requests
 
 # Import the function we're testing
-from HF_API_Integration import get_huggingface_model_metadata
+from src.HF_API_Integration import get_huggingface_model_metadata
 
 
 class TestHFAPIIntegration:
