@@ -32,17 +32,49 @@ def run_install() -> int:
 
 def parse_pytest_output(text: str) -> Tuple[int, int, float]:
     passed = 0
-    total = 0
     cov = 0.0
-    m = re.search(r"==\s*(\d+) passed", text)
-    if m:
-        passed = int(m.group(1))
-        total = passed
-    else:
-        m2 = re.search(r"(\d+) passed.*?(\d+) failed", text, re.S)
-        if m2:
-            passed = int(m2.group(1))
-            total = passed + int(m2.group(2))
+    counts = {
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+    }
+
+    summary_line = ""
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.search(r"\b(passed|failed|error|errors|skipped|xfailed|xpassed)\b", stripped):
+            summary_line = stripped
+            break
+
+    if summary_line:
+        label_map = {
+            "passed": "passed",
+            "failed": "failed",
+            "error": "errors",
+            "errors": "errors",
+            "skipped": "skipped",
+            "xfailed": "xfailed",
+            "xpassed": "xpassed",
+        }
+        for count, label in re.findall(r"(\d+)\s+([A-Za-z]+)", summary_line):
+            lower_label = label.lower()
+            key = label_map.get(lower_label)
+            if key:
+                counts[key] += int(count)
+    passed = counts["passed"]
+    total = (
+        counts["passed"]
+        + counts["failed"]
+        + counts["errors"]
+        + counts["skipped"]
+        + counts["xfailed"]
+        + counts["xpassed"]
+    )
     m3 = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", text)
     if m3:
         cov = float(m3.group(1))
