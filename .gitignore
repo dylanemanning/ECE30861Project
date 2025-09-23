@@ -1,0 +1,18 @@
+# Bytecode caches
+__pycache__/
+*.py[cod]
+
+# pytest cache
+.pytest_cache/
+
+# VS Code workspace settings
+.vscode/
+
+# Secrets / local tokens
+gh_token.txt
+
+# Other common ignores
+.env
+.venv/
+env/
+.DS_Store
