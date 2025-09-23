@@ -236,7 +236,7 @@ if __name__ == "__main__":
     print("Small repo:", compute_local_metrics(small_repo, license_str="MIT"))
 
     # Large repo: clone Linux repo into a temp dir (full history for contributors)
-    '''temp_dir = tempfile.mkdtemp()
+    temp_dir = tempfile.mkdtemp()
     try:
         print("Cloning Linux repo (this may take a while)...")
         # Full clone (slow but needed for accurate bus factor)
@@ -247,7 +247,7 @@ if __name__ == "__main__":
                         )
         print("Large repo:", compute_local_metrics(temp_dir, license_str="GPL-2.0"))
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)  # cleanup'''
+        shutil.rmtree(temp_dir, ignore_errors=True)  # cleanup
 
     # Analyze the large repo using analyze_repo
     test_repo = "https://github.com/pallets/flask"
