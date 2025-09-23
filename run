@@ -4,6 +4,8 @@
 Usage:
   ./run install   # installs requirements with pip --user
   ./run test      # runs pytest with coverage and prints summary
+  ./run <repo-url> [--output out.ndjson]
+                  # analyzes the given url and writes NDJSON to the given file
 """
 from __future__ import annotations
 
@@ -109,13 +111,55 @@ def run_tests() -> int:
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="run")
-    parser.add_argument("command", choices=("install", "test"))
+    parser.add_argument(
+        "command",
+        nargs="?",
+        help="install | test | <repo-url>",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        help=("Output NDJSON path when analyzing a repo"),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if not args.command:
+        parser.print_help()
+        return 2
+
     if args.command == "install":
         return run_install()
     if args.command == "test":
         return run_tests()
-    return 1
+
+    # If command is not 'install' or 'test', treat it as a repo URL to analyze
+    repo_url = args.command
+    out_path = args.output
+    # Build command to call the collector script
+    collector = os.path.join(ROOT, "src", "collect_ndjson.py")
+    if not os.path.exists(collector):
+        print("Collector script not found:", collector, file=sys.stderr)
+        return 1
+    cmd = [sys.executable, collector, "--repo", repo_url]
+    if out_path:
+        cmd.extend(["--output", out_path])
+    # Print status to stderr so collector can write NDJSON to stdout
+    print(
+        "Running repo analysis and writing NDJSON:",
+        " ".join(shlex.quote(c) for c in cmd),
+        file=sys.stderr,
+    )
+    proc = subprocess.run(cmd)
+    if proc.returncode == 0:
+        print("Collector finished", file=sys.stderr)
+        return 0
+    else:
+        print(
+            "Collector failed with exit code:",
+            proc.returncode,
+            file=sys.stderr,
+        )
+        return proc.returncode
 
 
 if __name__ == "__main__":
