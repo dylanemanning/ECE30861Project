@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Top-level runner script.
+
+Usage:
+  ./run install   # installs requirements with pip --user
+  ./run test      # runs pytest with coverage and prints summary
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import subprocess
+import sys
+from typing import Iterable, Tuple
+
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def run_install() -> int:
+    req = os.path.join(ROOT, "requirements.txt")
+    if not os.path.exists(req):
+        print("requirements.txt not found", file=sys.stderr)
+        return 1
+    cmd = [sys.executable, "-m", "pip", "install", "--user", "-r", req]
+    print("Installing requirements:", " ".join(shlex.quote(c) for c in cmd))
+    proc = subprocess.run(cmd)
+    return 0 if proc.returncode == 0 else 1
+
+
+def parse_pytest_output(text: str) -> Tuple[int, int, float]:
+    passed = 0
+    cov = 0.0
+    counts = {
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+    }
+
+    summary_line = ""
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.search(r"\b(passed|failed|error|errors|skipped|xfailed|xpassed)\b", stripped):
+            summary_line = stripped
+            break
+
+    if summary_line:
+        label_map = {
+            "passed": "passed",
+            "failed": "failed",
+            "error": "errors",
+            "errors": "errors",
+            "skipped": "skipped",
+            "xfailed": "xfailed",
+            "xpassed": "xpassed",
+        }
+        for count, label in re.findall(r"(\d+)\s+([A-Za-z]+)", summary_line):
+            lower_label = label.lower()
+            key = label_map.get(lower_label)
+            if key:
+                counts[key] += int(count)
+    passed = counts["passed"]
+    total = (
+        counts["passed"]
+        + counts["failed"]
+        + counts["errors"]
+        + counts["skipped"]
+        + counts["xfailed"]
+        + counts["xpassed"]
+    )
+    m3 = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", text)
+    if m3:
+        cov = float(m3.group(1))
+    else:
+        m4 = re.search(r"\b(\d+)%\s*covered", text)
+        if m4:
+            cov = float(m4.group(1))
+    return passed, total, cov
+
+
+def run_tests() -> int:
+    cmd = [sys.executable, "-m", "pytest", "-q", "--disable-warnings", "--maxfail=1", "--cov=src", "--cov-report=term"]
+    print("Running tests:", " ".join(shlex.quote(c) for c in cmd))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    output = proc.stdout or ""
+    print(output)
+    passed, total, cov = parse_pytest_output(output)
+    if total == 0:
+        # fallback: if pytest succeeded, assume all tests passed
+        if proc.returncode == 0:
+            total = passed
+        else:
+            # try to infer from output numbers
+            m = re.search(r"(\d+) failed", output)
+            if m:
+                total = int(m.group(1)) + passed
+            else:
+                total = max(passed, 0)
+    print(f"{passed}/{total} test cases passed. {cov:.0f}% line coverage achieved")
+    return 0 if proc.returncode == 0 else 1
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="run")
+    parser.add_argument("command", choices=("install", "test"))
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.command == "install":
+        return run_install()
+    if args.command == "test":
+        return run_tests()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
