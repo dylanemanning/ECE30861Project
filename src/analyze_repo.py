@@ -30,6 +30,42 @@ def is_lgpl_compatible(license_str):
     ]
     return 1 if license_str in compatible_licenses else 0
 
+def compute_code_quality(repo_path: str) -> float:
+    """
+    Compute a code quality score [0,1] for a repo using flake8.
+    Higher = better.
+    """
+    try:
+        # Count Python files first
+        python_files = 0
+        for root, dirs, files in os.walk(repo_path):
+            for file in files:
+                if file.endswith(".py"):
+                    python_files += 1
+
+        print(f"Found {python_files} Python files.")
+
+        result = subprocess.run(
+            ["flake8", repo_path],
+            capture_output=True,
+            text=True,
+            check=False  # don't raise exception on lint errors
+        )
+        # Count issues: each line = one problem
+        issues = len(result.stdout.strip().splitlines())
+        print(f"Found {issues} flake8 issues.")
+
+        # Normalize issues per Python file
+        avg_issues = issues / max(python_files, 1)  # avoid divide by zero
+        # Log-based soft normalization
+        score = 1.0 - avg_issues / 150 # average of 150 issues/file = 0.0
+        score = max(0.0, min(1.0, score))
+        return score
+    except FileNotFoundError:
+        # flake8 not installed: neutral score
+        return 0.5
+
+
 def compute_local_metrics(repo_path, license_str=None):
     """Compute normalized metrics for a local repo."""
 
@@ -77,7 +113,7 @@ def compute_local_metrics(repo_path, license_str=None):
     ramp_up_time = min(1.0, math.log1p(total_files) / math.log1p(1000000))
 
     # Code Quality: placeholder value
-    code_quality = 1.0 # COMPLETE?
+    code_quality = compute_code_quality(repo_path)
 
     # License Compatibility: 1 if compatible, 0 otherwise
     license_score = is_lgpl_compatible(license_str) if license_str else 0
