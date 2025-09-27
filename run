@@ -16,6 +16,14 @@ import shlex
 import subprocess
 import sys
 from typing import Iterable, Tuple
+import json
+import time
+import urllib.parse as urlparse
+import importlib
+import tempfile
+import shutil
+from typing import List
+import time as _time
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -49,7 +57,10 @@ def parse_pytest_output(text: str) -> Tuple[int, int, float]:
         stripped = line.strip()
         if not stripped:
             continue
-        if re.search(r"\b(passed|failed|error|errors|skipped|xfailed|xpassed)\b", stripped):
+        if re.search(
+            r"\b(passed|failed|error|errors|skipped|xfailed|xpassed)\b",
+            stripped,
+        ):
             summary_line = stripped
             break
 
@@ -88,9 +99,19 @@ def parse_pytest_output(text: str) -> Tuple[int, int, float]:
 
 
 def run_tests() -> int:
-    cmd = [sys.executable, "-m", "pytest", "-q", "--disable-warnings", "--cov=src", "--cov-report=term"]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "--disable-warnings",
+        "--cov=src",
+        "--cov-report=term",
+    ]
     print("Running tests:", " ".join(shlex.quote(c) for c in cmd))
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
     output = proc.stdout or ""
     print(output)
     passed, total, cov = parse_pytest_output(output)
@@ -105,7 +126,10 @@ def run_tests() -> int:
                 total = int(m.group(1)) + passed
             else:
                 total = max(passed, 0)
-    print(f"{passed}/{total} test cases passed. {cov:.0f}% line coverage achieved")
+    print(
+        f"{passed}/{total} test cases passed. {cov:.0f}% "
+        "line coverage achieved",
+    )
     return 0 if proc.returncode == 0 else 1
 
 
@@ -121,6 +145,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         "-o",
         help=("Output NDJSON path when analyzing a repo"),
     )
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help=(
+            "When analyzing a repo, pretty-print JSON instead of compact "
+            "NDJSON"
+        ),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if not args.command:
@@ -132,34 +164,606 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "test":
         return run_tests()
 
-    # If command is not 'install' or 'test', treat it as a repo URL to analyze
-    repo_url = args.command
-    out_path = args.output
-    # Build command to call the collector script
-    collector = os.path.join(ROOT, "src", "collect_ndjson.py")
-    if not os.path.exists(collector):
-        print("Collector script not found:", collector, file=sys.stderr)
-        return 1
-    cmd = [sys.executable, collector, "--repo", repo_url]
-    if out_path:
-        cmd.extend(["--output", out_path])
-    # Print status to stderr so collector can write NDJSON to stdout
-    print(
-        "Running repo analysis and writing NDJSON:",
-        " ".join(shlex.quote(c) for c in cmd),
-        file=sys.stderr,
-    )
-    proc = subprocess.run(cmd)
-    if proc.returncode == 0:
-        print("Collector finished", file=sys.stderr)
+    # If command is a file path, treat it as a URL file and process models
+    if os.path.isfile(args.command):
+        url_file = args.command
+        try:
+            with open(url_file, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            print("Failed to read URL file:", e, file=sys.stderr)
+            return 2
+
+        # classify URLs and pick model URLs only
+        model_urls = []
+        for u in lines:
+            parsed = urlparse.urlparse(u)
+            netloc = parsed.netloc.lower()
+            path_parts = [p for p in parsed.path.split("/") if p]
+            if "huggingface.co" in netloc:
+                # datasets explicitly under /datasets/
+                if len(path_parts) >= 1 and path_parts[0] == "datasets":
+                    # dataset URL -> skip
+                    continue
+                # otherwise treat as model URL
+                model_urls.append((u, path_parts))
+            elif "github.com" in netloc:
+                # code URL -> skip
+                continue
+            else:
+                # unknown host: skip
+                continue
+
+        # If none, succeed but do nothing
+        if not model_urls:
+            print("No model URLs found in the file.", file=sys.stderr)
+            return 0
+
+        # Prepare output: write to --output if provided, otherwise stdout
+        use_stdout = not args.output
+        if use_stdout:
+            out_fp = sys.stdout
+        else:
+            out_fp = open(args.output, "w", encoding="utf-8")
+
+        # Import HF API integration module lazily
+        try:
+            hf_mod = importlib.import_module("src.HF_API_Integration")
+        except Exception:
+            try:
+                hf_mod = importlib.import_module("HF_API_Integration")
+            except Exception as e:
+                print(
+                    "Failed importing HF_API_Integration:", e, file=sys.stderr
+                )
+                if not use_stdout:
+                    out_fp.close()
+                return 3
+
+    # Scoring heuristics (assumptions):
+    # AvailabilityScore = min(1, downloads / 10000)
+    # QualityScore = min(1, likes / 1000)
+    # DocumentationScore = 0.5 (placeholder)
+    # NetScore = weighted sum: Quality 0.5, Availability 0.3, Doc 0.2
+        w_quality = 0.5
+        w_avail = 0.3
+        w_doc = 0.2
+
+        for (full_url, parts) in model_urls:
+            # Derive model id: join first two parts if available, else the
+            # first
+            if len(parts) >= 2:
+                model_id = f"{parts[0]}/{parts[1]}"
+            elif len(parts) == 1:
+                model_id = parts[0]
+            else:
+                # skip malformed
+                continue
+
+            start = time.perf_counter()
+            try:
+                # try both import styles: module may be
+                # src.HF_API_Integration or HF_API_Integration
+                if hasattr(hf_mod, "get_huggingface_model_metadata"):
+                    meta = hf_mod.get_huggingface_model_metadata(model_id)
+                else:
+                    meta = None
+            except Exception as e:
+                meta = {"error": str(e)}
+            end = time.perf_counter()
+            latency_ms = int(round((end - start) * 1000))
+
+            downloads = 0
+            likes = 0
+            lastModified = "unknown"
+            if isinstance(meta, dict):
+                downloads = int(meta.get("downloads") or 0)
+                likes = int(meta.get("likes") or 0)
+                lastModified = meta.get("lastModified") or "unknown"
+
+            avail = min(1.0, downloads / 10000.0) if downloads >= 0 else 0.0
+            quality = min(1.0, likes / 1000.0) if likes >= 0 else 0.0
+            documentation = 0.5
+
+            net = w_quality * quality + w_avail * avail + w_doc * documentation
+            net = max(0.0, min(1.0, net))
+
+            out_obj = {
+                "ModelID": model_id,
+                "Downloads": downloads,
+                "Likes": likes,
+                "LastModified": lastModified,
+                "AvailabilityScore": round(avail, 3),
+                "QualityScore": round(quality, 3),
+                "DocumentationScore": round(documentation, 3),
+                "LatencyMS": latency_ms,
+                "NetScore": round(net, 3),
+            }
+
+            # write compact JSON NDJSON line
+            out_fp.write(json.dumps(out_obj, ensure_ascii=False))
+            out_fp.write("\n")
+
+        if not use_stdout:
+            out_fp.close()
+
         return 0
+
+    # Otherwise attempt to autodispatch the single URL.
+    repo_url = args.command
+    parsed = urlparse.urlparse(repo_url)
+    netloc = (parsed.netloc or "").lower()
+    path_parts = [p for p in (parsed.path or "").split("/") if p]
+
+    # Helper to write a single NDJSON record to a file-like object
+    def write_ndjson_fp(fp, obj: dict, pretty: bool = False) -> None:
+        if pretty:
+            fp.write(json.dumps(obj, ensure_ascii=False, indent=2))
+            fp.write("\n\n")
+        else:
+            fp.write(json.dumps(obj, ensure_ascii=False))
+            fp.write("\n")
+
+    # For any single URL, call both analyzers (repo and HF) and combine.
+    # Prepare output file/stream
+    use_stdout = not args.output
+    if use_stdout:
+        out_fp = sys.stdout
     else:
-        print(
-            "Collector failed with exit code:",
-            proc.returncode,
-            file=sys.stderr,
+        out_fp = open(args.output, "w", encoding="utf-8")
+
+    # Call analyze_repo helpers to obtain numeric metrics (without editing that
+    # module). We clone into a temp dir, compute local metrics, then remove it.
+    repo_data = None
+    try:
+        try:
+            analyze_mod = importlib.import_module("src.analyze_repo")
+        except Exception:
+            analyze_mod = importlib.import_module("analyze_repo")
+
+        # If the analyzer exposes clone_repo, try cloning locally. If clone
+        # fails, fall back to analyze_repo. If compute_local_metrics isn't
+        # available, compute simple heuristics here from stats/license.
+        if hasattr(analyze_mod, "clone_repo"):
+            temp_dir = tempfile.mkdtemp()
+            repo_data = None
+            try:
+                clone_failed = False
+                try:
+                    analyze_mod.clone_repo(repo_url, temp_dir)
+                except Exception as ce:
+                    clone_failed = True
+                    print(
+                        f"Clone failed for {repo_url}: {ce}", file=sys.stderr
+                    )
+
+                stats = {}
+                license_str = None
+                if not clone_failed:
+                    try:
+                        if hasattr(analyze_mod, "extract_repo_stats"):
+                            stats = analyze_mod.extract_repo_stats(temp_dir)
+                    except Exception:
+                        stats = {}
+                    try:
+                        if hasattr(analyze_mod, "extract_license"):
+                            license_str = analyze_mod.extract_license(temp_dir)
+                    except Exception:
+                        license_str = None
+                else:
+                    # Try fallback analyze_repo to obtain stats/license
+                    if hasattr(analyze_mod, "analyze_repo"):
+                        try:
+                            repo_data = analyze_mod.analyze_repo(repo_url)
+                        except Exception as ae:
+                            repo_data = {"error": str(ae)}
+                    if isinstance(repo_data, dict):
+                        license_str = repo_data.get("license")
+                        try:
+                            stats = {
+                                k: repo_data.get(k)
+                                for k in ("total_files", "python_files")
+                                if k in repo_data
+                            }
+                        except Exception:
+                            stats = {}
+
+                # compute numeric local metrics
+                local_metrics = {}
+                try:
+                    if (
+                        hasattr(analyze_mod, "compute_local_metrics")
+                        and not clone_failed
+                    ):
+                        local_metrics = (
+                            analyze_mod.compute_local_metrics(
+                                temp_dir, license_str=license_str
+                            )
+                            or {}
+                        )
+                    else:
+                        pfiles = int((stats or {}).get("python_files") or 0)
+                        tfiles = int((stats or {}).get("total_files") or 0)
+                        bus = min(1.0, pfiles / 100.0) if pfiles >= 0 else 0.0
+                        if tfiles <= 0:
+                            ramp = 0.0
+                        else:
+                            ramp = max(
+                                0.0, min(1.0, (tfiles - 50) / 1950.0)
+                            )
+                        try:
+                            ratio = pfiles / tfiles if tfiles > 0 else 0.0
+                            code_quality = min(1.0, ratio * 2.0)
+                        except Exception:
+                            code_quality = 0.0
+                        lic_num = 0.0
+                        try:
+                            low = (license_str or "").lower()
+                            if "mit" in low or "bsd" in low or "apache" in low:
+                                lic_num = 1.0
+                            elif "gpl" in low or "lgpl" in low:
+                                lic_num = 0.0
+                            else:
+                                lic_num = 0.5
+                        except Exception:
+                            lic_num = 0.0
+
+                        local_metrics = {
+                            "bus_factor": float(round(bus, 6)),
+                            "ramp_up_time": float(round(ramp, 6)),
+                            "code_quality": float(round(code_quality, 6)),
+                            "license_score_numeric": float(round(lic_num, 6)),
+                        }
+                except Exception:
+                    local_metrics = {}
+
+                # Build repo_data merging string fields + numeric metrics
+                if repo_data is None:
+                    parts = repo_url.rstrip("/").split("/")
+                    owner = parts[-2] if len(parts) >= 2 else ""
+                    repo_name = parts[-1] if parts else ""
+                    repo_data = {
+                        "repo": [owner, repo_name],
+                        "license": license_str or "Unknown",
+                        **(stats or {}),
+                    }
+                    if isinstance(local_metrics, dict):
+                        repo_data.update(local_metrics)
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        else:
+            # Fallback to analyze_repo if available
+            if hasattr(analyze_mod, "analyze_repo"):
+                repo_data = analyze_mod.analyze_repo(repo_url)
+            else:
+                repo_data = {"error": "analyze_repo missing"}
+    except Exception as e:
+        repo_data = {"error": str(e)}
+
+    # Call HF API integration (best-effort model id derivation)
+    hf_data = None
+    model_id = None
+    if "huggingface.co" in netloc:
+        # derive model parts similar to previous logic
+        if path_parts and path_parts[0] == "api":
+            if len(path_parts) >= 3 and path_parts[1] == "models":
+                mparts = path_parts[2:]
+            else:
+                mparts = []
+        else:
+            if path_parts and path_parts[0] != "datasets":
+                mparts = path_parts
+            else:
+                mparts = []
+        if mparts:
+            if len(mparts) >= 2:
+                model_id = f"{mparts[0]}/{mparts[1]}"
+            else:
+                model_id = mparts[0]
+    else:
+        # Heuristic: use last two path parts for possible org/name
+        if len(path_parts) >= 2:
+            model_id = f"{path_parts[-2]}/{path_parts[-1]}"
+        elif len(path_parts) == 1:
+            model_id = path_parts[0]
+
+    try:
+        try:
+            hf_mod = importlib.import_module("src.HF_API_Integration")
+        except Exception:
+            hf_mod = importlib.import_module("HF_API_Integration")
+        if model_id and hasattr(hf_mod, "get_huggingface_model_metadata"):
+            hf_data = hf_mod.get_huggingface_model_metadata(model_id)
+        else:
+            hf_data = {"note": "no model id derived"}
+    except Exception as e:
+        hf_data = {"error": str(e)}
+
+    # Build a standardized record with exactly the requested fields.
+    from typing import Optional
+
+    def map_license_score(lic: Optional[str]) -> float:
+        if not lic:
+            return 0.0
+        low = lic.lower()
+        if "mit" in low or "bsd" in low or "apache" in low:
+            return 1.0
+        if "gpl" in low or "lgpl" in low:
+            return 0.0
+        return 0.5
+
+    # Derive name and category heuristics
+    name = None
+    category = "CODE"
+    if "huggingface.co" in netloc:
+        if path_parts and path_parts[0] == "datasets":
+            category = "DATASET"
+            if len(path_parts) >= 2:
+                name = "/".join(path_parts[:2])
+            else:
+                name = "/".join(path_parts)
+        else:
+            category = "MODEL"
+            # prefer model_id if available
+            if model_id:
+                name = model_id
+            else:
+                name = "/".join(path_parts[-2:]) if path_parts else repo_url
+    elif "github.com" in netloc:
+        category = "CODE"
+        # owner/repo
+        if len(path_parts) >= 2:
+            name = f"{path_parts[0]}/{path_parts[1]}"
+        else:
+            name = repo_url
+    else:
+        name = repo_url
+
+    # Net score: prefer HF-derived metrics when available
+    net_score = 0.0
+    net_score_latency = 0
+    try:
+        # If hf_data contains downloads/likes, compute a simple net score
+        if isinstance(hf_data, dict) and (
+            "downloads" in hf_data or "likes" in hf_data
+        ):
+            downloads = int(hf_data.get("downloads") or 0)
+            likes = int(hf_data.get("likes") or 0)
+            avail = min(1.0, downloads / 10000.0) if downloads >= 0 else 0.0
+            quality = min(1.0, likes / 1000.0) if likes >= 0 else 0.0
+            documentation = 0.5
+            net_score_start = time.perf_counter()
+            net_score = 0.5 * quality + 0.3 * avail + 0.2 * documentation
+            net_score = max(0.0, min(1.0, net_score))
+            net_score_latency = int(
+                round((time.perf_counter() - net_score_start) * 1000)
+            )
+    except Exception:
+        net_score = 0.0
+        net_score_latency = 0
+
+    # Ramp up time and bus factor: use repo_data if available
+    ramp_up_time = 0.0
+    ramp_up_time_latency = 0
+    bus_factor = 0.0
+    bus_factor_latency = 0
+    try:
+        if isinstance(repo_data, dict):
+            ramp_up_time = float(repo_data.get("ramp_up_time") or 0.0)
+            bus_factor = float(repo_data.get("bus_factor") or 0.0)
+    except Exception:
+        ramp_up_time = 0.0
+        bus_factor = 0.0
+
+    # performance_claims: placeholder from hf_data
+    # (e.g., presence of tags or pipeline_tag)
+    performance_claims = 0.0
+    performance_claims_latency = 0
+    try:
+        if isinstance(hf_data, dict):
+            has_pipeline = bool(hf_data.get("pipeline_tag"))
+            has_tags = bool(hf_data.get("tags"))
+            performance_claims = 0.5 if (has_pipeline or has_tags) else 0.0
+    except Exception:
+        performance_claims = 0.0
+
+    # license clarity
+    license_score = 0.0
+    license_latency = 0
+    try:
+        if isinstance(repo_data, dict) and repo_data.get("license"):
+            license_score = map_license_score(repo_data.get("license"))
+    except Exception:
+        license_score = 0.0
+
+    # size_score and raspberry_pi compatibility (placeholders)
+    size_score = {"tiny": 0.0, "small": 0.0, "medium": 0.0, "large": 0.0}
+    raspberry_pi = {"jetson_nano": 0.0, "desktop_pc": 0.0, "aws_server": 0.0}
+    size_score_latency = 0
+
+    # dataset and code related scores
+    dataset_and_code_score = 0.0
+    dataset_and_code_score_latency = 0
+    dataset_quality = 0.0
+    dataset_quality_latency = 0
+    code_quality = 0.0
+    code_quality_latency = 0
+    try:
+        if isinstance(repo_data, dict):
+            code_quality = float(repo_data.get("code_quality") or 0.0)
+            dataset_quality = float(repo_data.get("dataset_quality") or 0.0)
+            dataset_and_code_score = float(
+                repo_data.get("dataset_and_code_score") or 0.0
+            )
+    except Exception:
+        code_quality = 0.0
+        dataset_quality = 0.0
+        dataset_and_code_score = 0.0
+
+    # Build final record with exactly the requested fields
+    record = {
+        "name": name,
+        "category": category,
+        "net_score": float(round(net_score, 6)),
+        "net_score_latency": int(net_score_latency),
+        "ramp_up_time": float(round(ramp_up_time, 6)),
+        "ramp_up_time_latency": int(ramp_up_time_latency),
+        "bus_factor": float(round(bus_factor, 6)),
+        "bus_factor_latency": int(bus_factor_latency),
+        "performance_claims": float(round(performance_claims, 6)),
+        "performance_claims_latency": int(performance_claims_latency),
+        "license": float(round(license_score, 6)),
+        "license_latency": int(license_latency),
+        "size_score": size_score,
+        "raspberry_pi": raspberry_pi,
+        "size_score_latency": int(size_score_latency),
+        "dataset_and_code_score": float(round(dataset_and_code_score, 6)),
+        "dataset_and_code_score_latency": int(dataset_and_code_score_latency),
+        "dataset_quality": float(round(dataset_quality, 6)),
+        "dataset_quality_latency": int(dataset_quality_latency),
+        "code_quality": float(round(code_quality, 6)),
+        "code_quality_latency": int(code_quality_latency),
+    }
+
+    try:
+        write_ndjson_fp(out_fp, record, pretty=args.pretty)
+    finally:
+        if not use_stdout:
+            out_fp.close()
+
+    return 0
+
+    # GitHub repositories -> call the collector (repo analysis)
+    if "github.com" in netloc or repo_url.endswith('.git'):
+        # Inline the collector behavior to avoid subprocess calls. This
+        # collects a single repo into NDJSON using the same helpers as
+        # the previous `src/collect_ndjson.py`.
+        def read_lines_file(path: str) -> List[str]:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = []
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    lines.append(s)
+                return lines
+
+        def write_ndjson_line(fp, obj: dict, pretty: bool = False) -> None:
+            if pretty:
+                fp.write(
+                    json.dumps(
+                        obj, ensure_ascii=False, indent=2, sort_keys=False
+                    )
+                )
+                fp.write("\n\n")
+            else:
+                fp.write(json.dumps(obj, ensure_ascii=False))
+                fp.write("\n")
+
+        def collect_and_write(
+            repos, models, output, append=False, pretty=False
+        ):
+            mode = "a" if append else "w"
+            written = 0
+            start_ts = _time.time()
+            use_stdout2 = output is None or output == "-"
+            if use_stdout2:
+                out = sys.stdout
+            else:
+                assert isinstance(output, str)
+                out = open(output, mode, encoding="utf-8")
+            try:
+                # lazy import sibling modules
+                mod_an = None
+                mod_hf = None
+                try:
+                    mod_an = importlib.import_module("src.analyze_repo")
+                except Exception:
+                    try:
+                        mod_an = importlib.import_module("analyze_repo")
+                    except Exception:
+                        mod_an = None
+                try:
+                    mod_hf = importlib.import_module("src.HF_API_Integration")
+                except Exception:
+                    try:
+                        mod_hf = importlib.import_module("HF_API_Integration")
+                    except Exception:
+                        mod_hf = None
+
+                for repo in repos:
+                    try:
+                        if (
+                            mod_an is not None
+                            and hasattr(mod_an, "analyze_repo")
+                        ):
+                            data = mod_an.analyze_repo(repo)
+                        else:
+                            data = {"error": "analyze_repo not available"}
+                    except Exception as e:
+                        data = {"error": str(e)}
+                    obj = {
+                        "type": "repo",
+                        "source": repo,
+                        "collected_at": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                        ),
+                        "data": data,
+                    }
+                    write_ndjson_line(out, obj, pretty=pretty)
+                    written += 1
+
+                for model in models:
+                    try:
+                        if (
+                            mod_hf is not None
+                            and hasattr(
+                                mod_hf, "get_huggingface_model_metadata"
+                            )
+                        ):
+                            data = (
+                                mod_hf.get_huggingface_model_metadata(model)
+                            )
+                        else:
+                            data = {
+                                "error": "HF API integration not available"
+                            }
+                    except Exception as e:
+                        data = {"error": str(e)}
+                    obj = {
+                        "type": "hf_model",
+                        "source": model,
+                        "collected_at": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                        ),
+                        "data": data,
+                    }
+                    write_ndjson_line(out, obj, pretty=pretty)
+                    written += 1
+
+            finally:
+                if not use_stdout2:
+                    out.close()
+            elapsed = _time.time() - start_ts
+            print(
+                f"Wrote {written} records to {output or 'stdout'} "
+                f"in {elapsed:.2f}s",
+                file=sys.stderr,
+            )
+            return 0
+
+        # call the inline collector for a single repo
+        return collect_and_write(
+            [repo_url], [], args.output or None,
+            append=False, pretty=args.pretty,
         )
-        return proc.returncode
+
+    # Unknown host: attempt collector as a last resort
+    # Unknown host: attempt the inline collector as a last resort
+    return collect_and_write(
+        [repo_url], [], args.output or None,
+        append=False, pretty=args.pretty,
+    )
 
 
 if __name__ == "__main__":
