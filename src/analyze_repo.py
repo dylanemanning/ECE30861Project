@@ -1,11 +1,6 @@
 # --- IMPORTS ---
 import os
-import sys
 import subprocess
-import tempfile
-import shutil
-import sys
-import requests  # For GitHub API license lookup
 from git import Repo  # pip install GitPython
 import math
 
@@ -68,9 +63,32 @@ def compute_code_quality(repo_path: str) -> float:
         return 0.5
 
 
+def compute_size_metric(repo_path: str, max_capacity_mb: float = 16*1024) -> float:
+    """
+    Compute normalized size score for ML model weight files.
+    Args:
+        repo_path: Local path to repository.
+        max_capacity_mb: Maximum hardware capacity in MB for normalization.
+    Returns:
+        Normalized score in [0,1], higher means repo fits better within hardware limits.
+    """
+    weight_exts = (".bin", ".h5", ".ckpt", ".safetensors")
+    total_bytes = 0
+    for root, _, files in os.walk(repo_path):
+        for f in files:
+            if f.endswith(weight_exts):
+                try:
+                    total_bytes += os.path.getsize(os.path.join(root, f))
+                except Exception:
+                    pass
+    size_mb = total_bytes / (1024 * 1024)
+    normalized = min(1.0, size_mb / max_capacity_mb) # Assumes 16GB max capacity
+    return normalized
+
 def compute_local_metrics(repo_path, license_str=None):
     """Compute normalized metrics for a local repo."""
 
+    # Bus Factor: based on commit history
     try:
         # Count commits per contributor
         result = subprocess.run(
@@ -100,19 +118,8 @@ def compute_local_metrics(repo_path, license_str=None):
     except Exception:
         bus_factor = 0.0  # fallback if git fails
 
-    # Ramp Up Time
-    total_files = 0
-    loc = 0
-    for root, dirs, files in os.walk(repo_path):
-        total_files += len(files)
-        for file in files:
-            if file.endswith(('.py', '.c', '.cpp', '.h', '.js', '.java', '.ts', '.go', '.rb', '.rs', '.cs')):
-                try:
-                    with open(os.path.join(root, file), 'r', encoding='utf-8', errors='ignore') as f:
-                        loc += sum(1 for _ in f)
-                except Exception:
-                    pass
-    ramp_up_time = min(1.0, math.log1p(total_files) / math.log1p(1000000))
+    # Size Metric (model weights)
+    size_score = compute_size_metric(repo_path)
 
     # Code Quality: placeholder value
     code_quality = compute_code_quality(repo_path)
@@ -122,9 +129,10 @@ def compute_local_metrics(repo_path, license_str=None):
 
     return {
         "bus_factor": bus_factor,
-        "ramp_up_time": ramp_up_time,
+        #"ramp_up_time": ramp_up_time,
         "code_quality": code_quality,
-        "license": license_score
+        "license": license_score,
+        "size": size_score
     }
 
 # --- REPO ANALYSIS ---
@@ -202,70 +210,85 @@ def extract_repo_stats(local_dir: str) -> dict:
         "python_files": python_files
     }
 
-
 def analyze_repo(repo_url: str) -> dict:
     """
     Clone a repo, extract license and stats, then clean up.
-    Args:
-        repo_url (str): GitHub repository URL.
-    Returns:
-        dict: Metadata including repo name, license, and stats.
+    Returns a dictionary with bus_factor, code_quality, license, lgpl_compatible, and size.
+    Handles invalid URLs and incomplete repos gracefully.
     """
-    # Create a temporary directory to clone the repo into
+    import tempfile, shutil, os, requests
+
+    # Default fallback metrics
+    default_metrics = {
+        "bus_factor": 0.0,
+        "size": 0.0,
+        "code_quality": 0.0,
+        "license": "Unknown",
+        "lgpl_compatible": False
+    }
+
     temp_dir = tempfile.mkdtemp()
-    # List of licenses considered compatible with LGPL
-    compatible_licenses = [
-        "LGPL-2.1",
-        "LGPL-2.1-only",
-        "LGPL-2.1-or-later",
-        "GPL-2.0",
-        "GPL-2.0-or-later",
-        "MIT",
-        "MIT/X11",
-        "BSD",
-        "BSD-2-Clause",
-        "BSD-3-Clause"
-    ]
-    # Parse owner/repo from the URL for GitHub API
+
     try:
-        parts = repo_url.rstrip('/').split('/')
-        owner, repo_name = parts[-2], parts[-1]
-        api_url = f"https://api.github.com/repos/{owner}/{repo_name}"
+        # Determine if repo_url is local path
+        if os.path.exists(repo_url):
+            local_dir = repo_url
+        else:
+            # Try to clone GitHub repo
+            local_dir = temp_dir
+            try:
+                clone_repo(repo_url, local_dir)
+            except Exception:
+                return {"repo": [repo_url], **default_metrics, "error": "Invalid or not supported URL"}
+
+        # Attempt to detect license
         license_type = "Unknown"
-        # Try to get license info from GitHub API
-        try:
-            resp = requests.get(api_url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("license") and data["license"].get("spdx_id"):
-                    license_type = data["license"]["spdx_id"]
-        except Exception:
-            pass
+        compatible_licenses = [
+            "LGPL-2.1", "LGPL-2.1-only", "LGPL-2.1-or-later",
+            "GPL-2.0", "GPL-2.0-or-later",
+            "MIT", "MIT/X11",
+            "BSD", "BSD-2-Clause", "BSD-3-Clause"
+        ]
+        owner = repo_name = None
 
-        # Clone the repo into the temp directory
-        clone_repo(repo_url, temp_dir)
-        # If license_type is still unknown, try to extract from files
+        if repo_url.startswith("https://github.com/"):
+            try:
+                parts = repo_url.rstrip("/").split("/")
+                owner, repo_name = parts[-2], parts[-1]
+                api_url = f"https://api.github.com/repos/{owner}/{repo_name}"
+                resp = requests.get(api_url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    license_type = data.get("license", {}).get("spdx_id", "Unknown")
+            except Exception:
+                pass
+
+        # Fallback: extract license from local files
         if license_type == "Unknown":
-            license_type = extract_license(temp_dir)
-        # Gather statistics about the repo's files
-        stats = extract_repo_stats(temp_dir)
+            try:
+                license_type = extract_license(local_dir)
+            except Exception:
+                license_type = "Unknown"
 
-        # Build and return the result dictionary
-        return {
-            # Get the last two parts of the repo URL for identification
-            "repo": [owner, repo_name],
+        # Compute local metrics (bus_factor, code_quality, size)
+        try:
+            metrics = compute_local_metrics(local_dir, license_type)
+        except Exception:
+            metrics = default_metrics
+
+        # Build result dictionary
+        repo_info = {
+            "repo": [repo_url] if not owner else [owner, repo_name],
             "license": license_type,
-            **stats,
-            # Check if the detected license is in the compatible list
             "lgpl_compatible": license_type in compatible_licenses
         }
+        repo_info.update(metrics)
+        return repo_info
+
     finally:
-        # Clean up the temporary directory after analysis
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-
-
-# --- TESTING ---
+# --- MAIN FOR MANUAL TESTING ---
 if __name__ == "__main__":
     print("Testing compute_local_metrics on two repos:")
 
@@ -274,7 +297,7 @@ if __name__ == "__main__":
     print("Small repo:", compute_local_metrics(small_repo, license_str="MIT"))
 
     # Large repo: clone Linux repo into a temp dir (full history for contributors)
-    temp_dir = tempfile.mkdtemp()
+    '''temp_dir = tempfile.mkdtemp()
     try:
         print("Cloning Linux repo (this may take a while)...")
         # Full clone (slow but needed for accurate bus factor)
@@ -285,9 +308,9 @@ if __name__ == "__main__":
                         )
         print("Large repo:", compute_local_metrics(temp_dir, license_str="GPL-2.0"))
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)  # cleanup
+        shutil.rmtree(temp_dir, ignore_errors=True)  # cleanup'''
 
     # Analyze the large repo using analyze_repo
-    test_repo = "https://github.com/pallets/flask"
+    test_repo = "https://huggingface.co/bigscience/bloom"
     info = analyze_repo(test_repo)
     print("analyze_repo result:", info)
