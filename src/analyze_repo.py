@@ -4,6 +4,7 @@ import sys
 import subprocess
 import tempfile
 import shutil
+import sys
 import requests  # For GitHub API license lookup
 from git import Repo  # pip install GitPython
 import math
@@ -39,13 +40,24 @@ def compute_code_quality(repo_path: str) -> float:
         )
         print(f"Found {python_files} Python files.")
 
+        flake8_path = shutil.which("flake8")
+        if flake8_path:
+            cmd = [flake8_path, "."]
+        else:
+            cmd = [sys.executable, "-m", "flake8", "."]
+
         result = subprocess.run(
-            [sys.executable, "-m", "flake8", repo_path],
+
             capture_output=True,
             text=True,
             check=False
         )
+
         issues = len(result.stdout.strip().splitlines())
+        if result.returncode == 1 and issues == 0:
+            # flake8 errored before reporting results
+            print("flake8 reported an error without lint output:", result.stderr.strip())
+            return 0.0
         print(f"Found {issues} flake8 issues.")
 
         avg_issues = issues / max(python_files, 1)
