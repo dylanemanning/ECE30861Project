@@ -1,5 +1,6 @@
 # --- IMPORTS ---
 import os
+import sys
 import subprocess
 import tempfile
 import shutil
@@ -32,18 +33,11 @@ def is_lgpl_compatible(license_str):
     return 1 if license_str in compatible_licenses else 0
 
 def compute_code_quality(repo_path: str) -> float:
-    """
-    Compute a code quality score [0,1] for a repo using flake8.
-    Higher = better.
-    """
     try:
-        # Count Python files first
-        python_files = 0
-        for root, dirs, files in os.walk(repo_path):
-            for file in files:
-                if file.endswith(".py"):
-                    python_files += 1
-
+        python_files = sum(
+            1 for root, dirs, files in os.walk(repo_path) 
+            for file in files if file.endswith(".py")
+        )
         print(f"Found {python_files} Python files.")
 
         flake8_path = shutil.which("flake8")
@@ -53,18 +47,12 @@ def compute_code_quality(repo_path: str) -> float:
             cmd = [sys.executable, "-m", "flake8", "."]
 
         result = subprocess.run(
-            cmd,
-            cwd=repo_path,
+
             capture_output=True,
             text=True,
-            check=False  # don't raise exception on lint errors
+            check=False
         )
-        if result.returncode not in (0, 1):
-            # Non-linting failure, treat as poor quality
-            print("flake8 execution failed:", result.stderr.strip())
-            return 0.0
 
-        # Count issues: each line = one problem
         issues = len(result.stdout.strip().splitlines())
         if result.returncode == 1 and issues == 0:
             # flake8 errored before reporting results
@@ -72,14 +60,11 @@ def compute_code_quality(repo_path: str) -> float:
             return 0.0
         print(f"Found {issues} flake8 issues.")
 
-        # Normalize issues per Python file
-        avg_issues = issues / max(python_files, 1)  # avoid divide by zero
-        # Log-based soft normalization
-        score = 1.0 - avg_issues / 150 # average of 150 issues/file = 0.0
-        score = max(0.0, min(1.0, score))
-        return score
-    except FileNotFoundError:
-        # flake8 not installed: neutral score
+        avg_issues = issues / max(python_files, 1)
+        score = 1.0 - avg_issues / 150
+        return max(0.0, min(1.0, score))
+    except Exception as e:
+        print(f"Error running flake8: {e}")
         return 0.5
 
 
