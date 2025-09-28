@@ -1,15 +1,10 @@
 # --- IMPORTS ---
-import math
 import os
-import shutil
 import subprocess
-import sys
-
 from git import Repo  # pip install GitPython
-
-if __name__ == "src.analyze_repo":
-    # Ensure the module is also reachable as `analyze_repo` for legacy imports/tests.
-    sys.modules.setdefault("analyze_repo", sys.modules[__name__])
+import math
+import shutil
+import sys
 
 # --- METRIC HELPERS ---
 def normalize_score(value, min_val, max_val):
@@ -34,14 +29,13 @@ def is_lgpl_compatible(license_str):
     ]
     return 1 if license_str in compatible_licenses else 0
 
-def compute_code_quality(repo_path: str) -> float:
+'''def compute_code_quality(repo_path: str) -> float:
     try:
         python_files = sum(
-            1 for root, _, files in os.walk(repo_path)
+            1 for root, dirs, files in os.walk(repo_path) 
             for file in files if file.endswith(".py")
         )
-        if python_files == 0:
-            return 1.0
+        print(f"Found {python_files} Python files.")
 
         flake8_path = shutil.which("flake8")
         if flake8_path:
@@ -50,33 +44,64 @@ def compute_code_quality(repo_path: str) -> float:
             cmd = [sys.executable, "-m", "flake8", "."]
 
         result = subprocess.run(
-            cmd,
+
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+        issues = len(result.stdout.strip().splitlines())
+        if result.returncode == 1 and issues == 0:
+            # flake8 errored before reporting results
+            print("flake8 reported an error without lint output:", result.stderr.strip())
+            return 0.0
+        print(f"Found {issues} flake8 issues.")
+
+        avg_issues = issues / max(python_files, 1)
+        score = 1.0 - avg_issues / 150
+        return max(0.0, min(1.0, score))
+    except Exception as e:
+        print(f"Error running flake8: {e}")
+        return 0.5'''
+
+def compute_code_quality(repo_path: str) -> float:
+    try:
+        python_files = sum(
+            1 for root, dirs, files in os.walk(repo_path) 
+            for file in files if file.endswith(".py")
+        )
+        print(f"Found {python_files} Python files.")
+
+        # Determine how to run flake8
+        flake8_path = shutil.which("flake8")
+        if flake8_path:
+            cmd = [flake8_path, "."]
+        else:
+            cmd = [sys.executable, "-m", "flake8", "."]
+
+        # Run flake8
+        result = subprocess.run(
+            cmd,  # pass the command here!
             cwd=repo_path,
             capture_output=True,
             text=True,
             check=False
         )
 
-        if result.returncode not in (0, 1):
-            print(f"flake8 failed with exit code {result.returncode}: {result.stderr.strip()}")
-            return 0.5
-
-        issue_lines = [line for line in result.stdout.splitlines() if line.strip()]
-        if result.returncode == 1 and not issue_lines:
-            # flake8 errored before reporting lint violations
+        issues = len(result.stdout.strip().splitlines())
+        if result.returncode != 0 and issues == 0:
+            # flake8 errored before reporting results
             print("flake8 reported an error without lint output:", result.stderr.strip())
-            return 0.5
+            return 0.0
+        print(f"Found {issues} flake8 issues.")
 
-        issues = len(issue_lines)
         avg_issues = issues / max(python_files, 1)
-        score = 1.0 - min(1.0, avg_issues / 150)
+        score = 1.0 - avg_issues / 150
         return max(0.0, min(1.0, score))
-    except FileNotFoundError:
-        print("flake8 is not available; returning neutral quality score.")
-        return 0.5
     except Exception as e:
         print(f"Error running flake8: {e}")
         return 0.5
+
 
 
 def compute_size_metric(repo_path: str, max_capacity_mb: float = 16*1024) -> float:
@@ -98,10 +123,8 @@ def compute_size_metric(repo_path: str, max_capacity_mb: float = 16*1024) -> flo
                 except Exception:
                     pass
     size_mb = total_bytes / (1024 * 1024)
-    if max_capacity_mb <= 0:
-        return 0.0
-    load_ratio = min(1.0, size_mb / max_capacity_mb)
-    return max(0.0, 1.0 - load_ratio)
+    normalized = min(1.0, size_mb / max_capacity_mb) # Assumes 16GB max capacity
+    return normalized
 
 def compute_local_metrics(repo_path, license_str=None):
     """Compute normalized metrics for a local repo."""
@@ -148,7 +171,7 @@ def compute_local_metrics(repo_path, license_str=None):
     return {
         "bus_factor": bus_factor,
         "code_quality": code_quality,
-        "license_score": license_score,
+        "license": license_score,
         "size": size_score
     }
 
@@ -182,30 +205,20 @@ def extract_license(local_dir: str) -> str:
                 try:
                     # Try to open and read the license file
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
-                        lowered = content.lower()
-
+                        content = f.read().lower()
+                        print(content)
                         # Check for common license keywords in the file content
-                        if "mit license" in lowered:
+                        if "mit" in content:
                             return "MIT"
-                        if "apache license" in lowered:
+                        elif "apache" in content:
                             return "Apache"
-
-                        if (
-                            "gnu lesser general public license" in lowered
-                            or "lesser general public license" in lowered
-                            or "gnu general public license" in lowered
-                            or "general public license" in lowered
-                            or " lgpl" in lowered
-                            or lowered.strip().startswith("gnu general public license")
-                        ):
+                        elif "gpl" in content or "lgpl" in content:
                             return "GPL/LGPL"
-
-                        if "bsd license" in lowered or "redistribution and use in source and binary forms" in lowered:
+                        elif "bsd" in content:
                             return "BSD"
-
-                        # If no known license is found, return Unknown
-                        return "Unknown"
+                        else:
+                            # If no known license is found, return Unknown
+                            return "Unknown"
                 except Exception:
                     # If the file can't be read, treat as Unknown
                     return "Unknown"
@@ -250,7 +263,8 @@ def analyze_repo(repo_url: str) -> dict:
         "bus_factor": 0.0,
         "size": 0.0,
         "code_quality": 0.0,
-        "license_score": 0,
+        "license": "Unknown",
+        "lgpl_compatible": False
     }
 
     temp_dir = tempfile.mkdtemp()
@@ -265,13 +279,7 @@ def analyze_repo(repo_url: str) -> dict:
             try:
                 clone_repo(repo_url, local_dir)
             except Exception:
-                return {
-                    "repo": [repo_url],
-                    "license": "Unknown",
-                    "lgpl_compatible": False,
-                    **default_metrics,
-                    "error": "Invalid or not supported URL"
-                }
+                return {"repo": [repo_url], **default_metrics, "error": "Invalid or not supported URL"}
 
         # Attempt to detect license
         license_type = "Unknown"
@@ -306,14 +314,7 @@ def analyze_repo(repo_url: str) -> dict:
         try:
             metrics = compute_local_metrics(local_dir, license_type)
         except Exception:
-            metrics = default_metrics.copy()
-
-        metrics.setdefault("license_score", is_lgpl_compatible(license_type))
-
-        try:
-            repo_stats = extract_repo_stats(local_dir)
-        except Exception:
-            repo_stats = {}
+            metrics = default_metrics
 
         # Build result dictionary
         repo_info = {
@@ -321,9 +322,7 @@ def analyze_repo(repo_url: str) -> dict:
             "license": license_type,
             "lgpl_compatible": license_type in compatible_licenses
         }
-        repo_info.update(default_metrics)
         repo_info.update(metrics)
-        repo_info.update(repo_stats)
         return repo_info
 
     finally:
@@ -352,6 +351,6 @@ if __name__ == "__main__":
         shutil.rmtree(temp_dir, ignore_errors=True)  # cleanup'''
 
     # Analyze the large repo using analyze_repo
-    test_repo = "https://huggingface.co/bigscience/bloom"
+    test_repo = "https://huggingface.co/google/gemma-3-270m/tree/main"
     info = analyze_repo(test_repo)
     print("analyze_repo result:", info)
