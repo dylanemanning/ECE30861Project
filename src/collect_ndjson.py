@@ -133,168 +133,71 @@ def write_ndjson_line(fp, obj: dict) -> None:
 def collect_and_write(
     repos: Iterable[str],
     models: Iterable[object],
+    output: Optional[str] = None,
+    append: bool = False,
 ) -> int:
-    """Collect data and write NDJSON to stdout only."""
-    written = 0
+    """Collect repo/model data and write each record as NDJSON."""
+
     start_ts = time.time()
-    out = sys.stdout
+    written = 0
+
+    use_stdout = output is None or output == "-"
+    mode = "a" if append else "w"
+    if use_stdout:
+        out_fp = sys.stdout
+    else:
+        out_fp = open(output, mode, encoding="utf-8")
+
+    def _timestamp() -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
     try:
-        # Optional: still support repos, but don't emit to NDJSON to keep schema consistent.
         for repo in repos:
             try:
-                _ = _analyze_repo_fn(repo)
-                log(f"Analyzed repo {repo}", level=2)
-            except Exception as e:
-                log(f"Repo analysis failed for {repo}: {e}", level=1)
-
-        # Lazy import to avoid overhead when not needed
-        try:
-            from genai_readme_analysis import analyze_metrics, discover_dataset_url_with_genai  # type: ignore
-        except Exception:
-            analyze_metrics = None  # type: ignore
-            discover_dataset_url_with_genai = None  # type: ignore
-
-        def _round2(x: Any) -> Any:
-            try:
-                if isinstance(x, float):
-                    return round(x, 2)
-                if isinstance(x, (int,)):
-                    return x
-                return x
-            except Exception:
-                return x
-
-        for model in models:
-            code_url = ""
-            dataset_url = ""
-            model_url = model
-            if isinstance(model, tuple) and len(model) == 3:
-                code_url, dataset_url, model_url = model  # type: ignore
-            # Fetch README markdown from model card to help GenAI find dataset description sections
-            readme_text = ""
-            try:
-                readme_text = _hf_readme_text_fn(str(model_url)) or ""
-                if readme_text:
-                    log(f"Fetched README for {model_url} ({len(readme_text)} chars)", level=2)
-            except Exception as e:
-                log(f"Failed to fetch README for {model_url}: {e}", level=1)
-            # Normalize dataset_url: treat placeholders and non-HF links as empty to trigger discovery
-            raw_dataset = str(dataset_url or "").strip()
-            if raw_dataset and raw_dataset.lower() in {"none", "null", "na", "n/a", "-"}:
-                log(f"Input dataset placeholder detected; will attempt discovery (value={raw_dataset})", level=2)
-                dataset_url = ""
-            elif raw_dataset and not raw_dataset.startswith("https://huggingface.co/datasets/"):
-                # Provided but not a HF datasets URL; ignore to allow discovery
-                log(f"Non-HF dataset link provided; ignoring for HF quality and attempting discovery: {raw_dataset}", level=2)
-                dataset_url = ""
-            else:
-                dataset_url = raw_dataset
-            try:
-                hf = _hf_meta_fn(str(model_url))
-            except Exception as e:
-                log(f"HF fetch failed for {model_url}: {e}", level=1)
-                hf = {"model_id": str(model_url), "error": str(e)}
-
-            genai: Dict[str, Any] = {}
-            if analyze_metrics:
-                try:
-                    genai = analyze_metrics(
-                        readme=readme_text,
-                        code=code_url,
-                        metadata="",
-                        dataset_link=dataset_url,
-                        model=str(model_url),
-                    ) or {}
-                except Exception as ee:
-                    log(f"GenAI analysis failed for code={code_url} dataset={dataset_url}: {ee}", level=1)
-
-            # If dataset_url is a HF dataset, compute dataset_quality using HF API (preferred)
-            dsq: Dict[str, Any] = {}
-            # If dataset not provided, try GenAI discovery using README context
-            if not dataset_url:
-                log(f"No dataset URL provided for model={model_url}; attempting GenAI discovery", level=2)
-                try:
-                    if 'discover_dataset_url_with_genai' in locals() and discover_dataset_url_with_genai:
-                        ds_disc = discover_dataset_url_with_genai(readme=readme_text, model=str(model_url)) or {}
-                    else:
-                        ds_disc = {}
-                except Exception as e:
-                    log(f"GenAI dataset discovery failed for {model_url}: {e}", level=1)
-                    ds_disc = {}
-                discovered = str(ds_disc.get("dataset_url") or "").strip() if isinstance(ds_disc, dict) else ""
-                if discovered:
-                    # Normalize if only id was returned
-                    if not discovered.startswith("http") and "/" in discovered:
-                        discovered = f"https://huggingface.co/datasets/{discovered}"
-                    if discovered.startswith("https://huggingface.co/datasets/"):
-                        dataset_url = discovered
-                        log(f"Using GenAI-discovered dataset URL: {dataset_url}", level=2)
-                    else:
-                        log(f"GenAI discovery returned non-HF dataset URL; ignoring: {discovered}", level=1)
-            # HF fallback discovery if still missing
-            if (not dataset_url):
-                fallback = _hf_discover_dataset_for_model(str(model_url))
-                if fallback:
-                    dataset_url = fallback
-                    log(f"Using HF-discovered dataset URL: {dataset_url}", level=2)
-                else:
-                    log(f"HF fallback could not find a dataset for model={model_url}", level=2)
-            if dataset_url and dataset_url.startswith("http"):
-                try:
-                    log(f"Computing dataset_quality for dataset={dataset_url}", level=2)
-                    dsq = _hf_dataset_quality_fn(dataset_url) or {}
-                except Exception as e:
-                    log(f"HF dataset quality failed for {dataset_url}: {e}", level=1)
-
-            # Build flat record per expected schema
-            name = str(hf.get("model_id", str(model_url))).split("/")[-1]
-            record: Dict[str, Any] = {
-                "name": name,
-                "category": "MODEL",
+                payload = _analyze_repo_fn(repo)
+            except Exception as exc:
+                payload = {"error": str(exc)}
+            record = {
+                "type": "repo",
+                "source": repo,
+                "collected_at": _timestamp(),
+                "data": payload,
             }
-
-            # Intentionally omit size and license metrics. HF module now only provides model_id.
-
-            # GenAI-derived fields (pass through if present)
-            for k in [
-                "ramp_up_time",
-                "performance_claims",
-                "dataset_and_code_score",
-                # Only include the metrics we now support from GenAI
-            ]:
-                if k in genai:
-                    record[k] = _round2(genai[k])
-                lat_k = f"{k}_latency"
-                if lat_k in genai:
-                    try:
-                        record[lat_k] = int(genai[lat_k])
-                    except Exception:
-                        pass
-
-            # Prefer HF dataset_quality if available; otherwise, if GenAI provided dataset_quality (because dataset was missing), include it
-            if dsq.get("dataset_quality") is not None:
-                record["dataset_quality"] = _round2(dsq.get("dataset_quality"))
-                if dsq.get("dataset_quality_latency") is not None:
-                    record["dataset_quality_latency"] = int(dsq.get("dataset_quality_latency") or 0)
-            elif genai.get("dataset_quality") is not None:
-                record["dataset_quality"] = _round2(genai.get("dataset_quality"))
-                lat = genai.get("dataset_quality_latency")
-                if lat is not None:
-                    try:
-                        record["dataset_quality_latency"] = int(lat)
-                    except Exception:
-                        pass
-            # If HF dataset quality not computed, we do not include it (no GenAI dataset_quality now)
-
-            write_ndjson_line(out, record)
+            write_ndjson_line(out_fp, record)
             written += 1
 
+        for model in models:
+            code_url: Optional[str] = None
+            dataset_url: Optional[str] = None
+            model_id = model
+            if isinstance(model, tuple) and len(model) == 3:
+                code_url, dataset_url, model_id = model  # type: ignore[misc]
+            model_str = str(model_id)
+            try:
+                payload = _hf_meta_fn(model_str)
+            except Exception as exc:
+                payload = {"error": str(exc)}
+
+            record: Dict[str, Any] = {
+                "type": "hf_model",
+                "source": model_str,
+                "collected_at": _timestamp(),
+                "data": payload,
+            }
+            if code_url:
+                record["code_url"] = code_url
+            if dataset_url:
+                record["dataset_url"] = dataset_url
+
+            write_ndjson_line(out_fp, record)
+            written += 1
     finally:
-        pass
+        if not use_stdout:
+            out_fp.close()
 
     elapsed = time.time() - start_ts
-    # Print summary to stderr so stdout remains pure NDJSON when used in pipes
-    log(f"Wrote {written} records to stdout in {elapsed:.2f}s", level=1)
+    target = output or "stdout"
+    log(f"Wrote {written} records to {target} in {elapsed:.2f}s", level=1)
     return 0
 
 
@@ -324,7 +227,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--models-file",
         help="Path to a file with one model id per line",
     )
-    # Output is always stdout; no --output flag.
+    p.add_argument(
+        "--output",
+        help="Path to write NDJSON output (default: stdout)",
+    )
+    p.add_argument(
+        "--append",
+        action="store_true",
+        help="Append to the output file instead of overwriting",
+    )
     return p.parse_args(argv)
 
 
@@ -348,12 +259,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception as e:
                 log(f"url_handler failed: {e}", level=1)
                 records = []
-            out = sys.stdout
+            use_stdout = not args.output or args.output == "-"
+            mode = "a" if args.append else "w"
+            if use_stdout:
+                out = sys.stdout
+            else:
+                out = open(args.output, mode, encoding="utf-8")
             written = 0
-            for rec in records:
-                write_ndjson_line(out, rec)
-                written += 1
-            log(f"Wrote {written} records via url_handler", level=1)
+            try:
+                for rec in records:
+                    write_ndjson_line(out, rec)
+                    written += 1
+            finally:
+                if not use_stdout:
+                    out.close()
+            log(
+                f"Wrote {written} records via url_handler to {args.output or 'stdout'}",
+                level=1,
+            )
             return 0
         else:
             log("url_handler not available; no models processed", level=1)
@@ -366,7 +289,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 2
 
-    return collect_and_write(repos, models)
+    return collect_and_write(
+        repos,
+        models,
+        output=args.output,
+        append=bool(args.append),
+    )
 
 
 if __name__ == "__main__":

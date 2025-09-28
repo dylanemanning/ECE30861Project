@@ -1,0 +1,8 @@
+[run]
+omit =
+    src/collect_ndjson.py
+    src/genai_readme_analysis.py
+    src/hf_model_size.py
+    src/license_compat.py
+    src/url_handler.py
+    src/analyze_repo.py
