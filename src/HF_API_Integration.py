@@ -53,6 +53,11 @@ def fetch_model_metrics(model_id: str) -> Optional[Dict[str, Any]]:
 def output_ndjson(record: Dict[str, Any]) -> None:
     print(json.dumps(record, separators=(",", ":")))
 
+
+# Backwards-compatible name used by the runner/tests
+def get_huggingface_model_metadata(model_id: str) -> Optional[Dict[str, Any]]:
+    return fetch_model_metrics(model_id)
+
 if __name__ == "__main__":
     # Example: process a list of model IDs (for CLI integration)
     sample_models = ["google/gemma-3-270m", "bert-base-uncased"]
