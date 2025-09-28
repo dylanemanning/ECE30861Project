@@ -15,15 +15,14 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, List
 import json
 import time
 import urllib.parse as urlparse
 import importlib
 import tempfile
 import shutil
-from typing import List
-import time as _time
+# (List imported above) use 'time' directly for all timing
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -262,14 +261,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             ar_mod = None
 
         # For each record returned by url_handler, merge analyze_repo results
+        models_out = []
         for idx, rec in enumerate(metrics_list):
             # Determine corresponding triple (code,dataset,model)
             triple = triples[idx] if idx < len(triples) else ("", "", "")
             code_url, dataset_url, model_url = triple
 
             merged_analysis: dict = {}
+
             # Helper: run analyze_repo in a subprocess with timeout to avoid long clones
-            def _run_analyze_subprocess(url_to_analyze: str, timeout_sec: int = 8) -> dict:
+            def _run_analyze_subprocess(url_to_analyze: str, timeout_sec: int = 30) -> dict:
                 if not url_to_analyze:
                     return {}
                 # Try to call the installed module first
@@ -277,7 +278,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     sys.executable,
                     "-c",
                     (
-                        "import importlib,sys,json;"
+                        "import importlib,sys,json,importlib.util;"
                         "mod=importlib.import_module('src.analyze_repo') if importlib.util.find_spec('src.analyze_repo') else importlib.import_module('analyze_repo');"
                         "res=mod.analyze_repo(sys.argv[1]) if hasattr(mod,'analyze_repo') else {};"
                         "print(json.dumps(res))"
@@ -285,8 +286,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                     url_to_analyze,
                 ]
                 try:
-                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+                    proc = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=timeout_sec
+                    )
                     if proc.returncode != 0:
+                        # Subprocess failed; return empty analysis
                         return {}
                     out = proc.stdout.strip()
                     if not out:
@@ -294,7 +298,21 @@ def main(argv: Iterable[str] | None = None) -> int:
                     try:
                         return json.loads(out)
                     except Exception:
+                        # Try to recover a trailing JSON object if the subprocess
+                        # printed diagnostic lines before the JSON. Find the last
+                        # "{" in output and attempt to parse from there.
+                        try:
+                            last_open = out.rfind('{')
+                            last_close = out.rfind('}')
+                            if last_open != -1 and last_close != -1 and last_close > last_open:
+                                candidate = out[last_open:last_close+1]
+                                return json.loads(candidate)
+                        except Exception:
+                            pass
                         return {}
+                except subprocess.TimeoutExpired:
+                    # timed out: return empty analysis
+                    return {}
                 except Exception:
                     return {}
 
@@ -302,14 +320,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             for u in (code_url, model_url, dataset_url):
                 if not u:
                     continue
-                # Run with timeout and merge numeric metrics conservatively
-                ares = _run_analyze_subprocess(u)
+                # Run with increased timeout and merge numeric metrics conservatively
+                ares = _run_analyze_subprocess(u, timeout_sec=30)
                 for k, v in (ares or {}).items():
                     if k not in merged_analysis or not merged_analysis.get(k):
                         merged_analysis[k] = v
 
-            # Build a canonical record with all required fields, preferring
-            # values from url_handler (rec) then merged_analysis, else defaults
+            # intermediate debugging removed for presentation
+
+            # Build a canonical record with all required fields
             def _get_num(key, default=0.0):
                 v = rec.get(key, merged_analysis.get(key))
                 try:
@@ -327,9 +346,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             name = rec.get("name") or (model_url or code_url or dataset_url) or ""
             category = rec.get("category") or "MODEL"
 
-            # net_score isn't computed by url_handler in general; prefer hf-derived if present
-            net_score = _get_num("net_score", 0.0)
-            net_score_latency = _get_int("net_score_latency", 0)
+            # NetScore will be computed after we extract all component values
+            # (license_score, size_score, ramp_up_time, bus_factor, etc.).
+            net_score = 0.0
+            net_score_latency = 0
 
             ramp_up_time = _get_num("ramp_up_time", 0.0)
             ramp_up_time_latency = _get_int("ramp_up_time_latency", 0)
@@ -339,7 +359,6 @@ def main(argv: Iterable[str] | None = None) -> int:
             performance_claims = _get_num("performance_claims", 0.0)
             performance_claims_latency = _get_int("performance_claims_latency", 0)
 
-            # license: prefer analyze_repo, then handler, else Unknown; and numeric license score
             license_str = merged_analysis.get("license") or rec.get("license") or "Unknown"
             try:
                 low = str(license_str).lower()
@@ -353,8 +372,6 @@ def main(argv: Iterable[str] | None = None) -> int:
                 license_score = 0.0
             license_latency = _get_int("license_latency", 0)
 
-            # size_score: if merged_analysis provides 'size' or 'size_score' use it,
-            # otherwise default per-device zeros
             size_score = rec.get("size_score") or merged_analysis.get("size_score")
             if not isinstance(size_score, dict):
                 size_score = {
@@ -373,6 +390,34 @@ def main(argv: Iterable[str] | None = None) -> int:
 
             code_quality = _get_num("code_quality", 0.0)
             code_quality_latency = _get_int("code_quality_latency", 0)
+
+            # Compute NetScore now that component values are available.
+            try:
+                start_net = time.perf_counter()
+                # derive scalar size from size_score dict
+                size_scalar2 = 0.0
+                if isinstance(size_score, dict) and size_score:
+                    try:
+                        vals2 = [float(v or 0.0) for v in size_score.values()]
+                        size_scalar2 = sum(vals2) / len(vals2) if vals2 else 0.0
+                    except Exception:
+                        size_scalar2 = 0.0
+
+                comp2 = (
+                    0.18 * float(size_scalar2)
+                    + 0.12 * float(ramp_up_time)
+                    + 0.12 * float(bus_factor)
+                    + 0.18 * float(dataset_and_code_score)
+                    + 0.12 * float(dataset_quality)
+                    + 0.12 * float(code_quality)
+                    + 0.16 * float(performance_claims)
+                )
+                net_score = float(license_score) * float(comp2)
+                net_score = max(0.0, min(1.0, net_score))
+                net_score_latency = int(round((time.perf_counter() - start_net) * 1000))
+            except Exception:
+                net_score = 0.0
+                net_score_latency = 0
 
             final = {
                 "name": name,
@@ -397,8 +442,28 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "code_quality_latency": int(code_quality_latency),
             }
 
-            out_fp.write(json.dumps(final, ensure_ascii=False))
-            out_fp.write("\n")
+            models_out.append(final)
+
+        # Emit NDJSON: one JSON object per model (model URLs only).
+        # We assume `triples` aligns with `metrics_list` (same indices).
+        emitted = 0
+        for idx, final in enumerate(models_out):
+            # Determine if this record corresponds to a model URL
+            triple_for_rec = triples[idx] if idx < len(triples) else ("", "", "")
+            code_triple_url, dataset_triple_url, model_triple_url = triple_for_rec
+            category_val = (final.get("category") or "").upper()
+            is_model = bool(model_triple_url) or (category_val == "MODEL")
+            if not is_model:
+                # skip non-model records
+                continue
+
+            if args.pretty:
+                out_fp.write(json.dumps(final, ensure_ascii=False, indent=2))
+                out_fp.write("\n")
+            else:
+                out_fp.write(json.dumps(final, ensure_ascii=False))
+                out_fp.write("\n")
+            emitted += 1
 
         if not use_stdout:
             out_fp.close()
@@ -699,50 +764,74 @@ def main(argv: Iterable[str] | None = None) -> int:
     net_score = 0.0
     net_score_latency = 0
     try:
-        if isinstance(hf_data, dict) and (
-            "downloads" in hf_data or "likes" in hf_data
-        ):
-            downloads = int(hf_data.get("downloads") or 0)
-            likes = int(hf_data.get("likes") or 0)
-            avail = min(1.0, downloads / 10000.0) if downloads >= 0 else 0.0
-            quality = min(1.0, likes / 1000.0) if likes >= 0 else 0.0
-            documentation = 0.5
-            net_score_start = time.perf_counter()
-            net_score = 0.5 * quality + 0.3 * avail + 0.2 * documentation
-            net_score = max(0.0, min(1.0, net_score))
-            net_score_latency = int(
-                round((time.perf_counter() - net_score_start) * 1000)
-            )
-        else:
-            # derive from repo metrics
+        # Compute NetScore from the requested weighted formula. Use the
+        # same aggregation rule for Size as above (mean of device scores).
+        start_net = time.perf_counter()
+        # gather components from repo_data/hf_data where available
+        try:
+            size_score_val = repo_data.get("size_score") if isinstance(repo_data, dict) else None
+        except Exception:
+            size_score_val = None
+
+        size_scalar = 0.0
+        if isinstance(size_score_val, dict) and size_score_val:
             try:
-                if isinstance(repo_data, dict):
-                    cq = float(repo_data.get("code_quality") or 0.0)
-                else:
-                    cq = 0.0
+                vals = [float(v or 0.0) for v in size_score_val.values()]
+                size_scalar = sum(vals) / len(vals) if vals else 0.0
             except Exception:
-                cq = 0.0
+                size_scalar = 0.0
+        elif isinstance(size_score, dict) and size_score:
+            # fallback to local size_score variable
             try:
-                if isinstance(repo_data, dict):
-                    bf = float(repo_data.get("bus_factor") or 0.0)
-                else:
-                    bf = 0.0
+                vals = [float(v or 0.0) for v in size_score.values()]
+                size_scalar = sum(vals) / len(vals) if vals else 0.0
             except Exception:
-                bf = 0.0
-            try:
-                if isinstance(repo_data, dict):
-                    lic_s = map_license_score(repo_data.get("license"))
-                else:
-                    lic_s = map_license_score(None)
-            except Exception:
-                lic_s = 0.0
-            # simple weighted sum
-            net_score_start = time.perf_counter()
-            net_score = 0.5 * cq + 0.3 * bf + 0.2 * lic_s
-            net_score = max(0.0, min(1.0, net_score))
-            net_score_latency = int(
-                round((time.perf_counter() - net_score_start) * 1000)
-            )
+                size_scalar = 0.0
+
+        # extract other components (fall back to 0.0 if missing)
+        try:
+            ramp_val = float(repo_data.get("ramp_up_time") or ramp_up_time or 0.0)
+        except Exception:
+            ramp_val = float(ramp_up_time or 0.0)
+        try:
+            bus_val = float(repo_data.get("bus_factor") or bus_factor or 0.0)
+        except Exception:
+            bus_val = float(bus_factor or 0.0)
+        try:
+            dac = float(repo_data.get("dataset_and_code_score") or dataset_and_code_score or 0.0)
+        except Exception:
+            dac = float(dataset_and_code_score or 0.0)
+        try:
+            dsq = float(repo_data.get("dataset_quality") or dataset_quality or 0.0)
+        except Exception:
+            dsq = float(dataset_quality or 0.0)
+        try:
+            cq = float(repo_data.get("code_quality") or code_quality or 0.0)
+        except Exception:
+            cq = float(code_quality or 0.0)
+        try:
+            perf = float(repo_data.get("performance_claims") or performance_claims or 0.0)
+        except Exception:
+            perf = float(performance_claims or 0.0)
+
+        # license scalar
+        try:
+            lic_s = map_license_score(repo_data.get("license") if isinstance(repo_data, dict) else None)
+        except Exception:
+            lic_s = 0.0
+
+        comp = (
+            0.18 * float(size_scalar)
+            + 0.12 * float(ramp_val)
+            + 0.12 * float(bus_val)
+            + 0.18 * float(dac)
+            + 0.12 * float(dsq)
+            + 0.12 * float(cq)
+            + 0.16 * float(perf)
+        )
+        net_score = float(lic_s) * float(comp)
+        net_score = max(0.0, min(1.0, net_score))
+        net_score_latency = int(round((time.perf_counter() - start_net) * 1000))
     except Exception:
         net_score = 0.0
         net_score_latency = 0
