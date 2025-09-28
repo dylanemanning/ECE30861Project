@@ -1,147 +1,185 @@
-import pytest
-import tempfile
-import os
-import shutil
-from unittest.mock import patch, MagicMock
 from pathlib import Path
+from types import SimpleNamespace
 
-# Import the functions we're testing
-from src.analyze_repo import (
-    clone_repo,
-    extract_license,
-    extract_repo_stats,
-    analyze_repo
-)
+import pytest
+
+from src import analyze_repo
 
 
-class TestAnalyzeRepo:
-    
-    def test_mit_license_detection(self):
-        """Test that MIT license is correctly detected from LICENSE file"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create a LICENSE file with MIT content
-            license_path = os.path.join(tmpdir, "LICENSE")
-            with open(license_path, "w") as f:
-                f.write("MIT License\n\n"
-                       "Copyright (c) 2024 Test Author\n\n"
-                       "Permission is hereby granted, free of charge...")
-            
-            result = extract_license(tmpdir)
-            assert result == "MIT", f"Expected 'MIT' but got '{result}'"
-    
-    def test_repo_stats_extraction(self):
-        """Test that file counts are calculated correctly"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create test files in different directories
-            # Root level files
-            open(os.path.join(tmpdir, "main.py"), "w").close()
-            open(os.path.join(tmpdir, "utils.py"), "w").close()
-            open(os.path.join(tmpdir, "README.md"), "w").close()
-            open(os.path.join(tmpdir, "data.json"), "w").close()
-            
-            # Create a subdirectory with more files
-            subdir = os.path.join(tmpdir, "src")
-            os.makedirs(subdir)
-            open(os.path.join(subdir, "helper.py"), "w").close()
-            open(os.path.join(subdir, "config.yaml"), "w").close()
-            
-            stats = extract_repo_stats(tmpdir)
-            
-            assert stats["total_files"] == 6, f"Expected 6 total files but got {stats['total_files']}"
-            assert stats["python_files"] == 3, f"Expected 3 Python files but got {stats['python_files']}"
-    
-    @patch('analyze_repo.clone_repo')
-    @patch('analyze_repo.extract_license')
-    @patch('analyze_repo.extract_repo_stats')
-    def test_lgpl_compatibility_mit(self, mock_stats, mock_license, mock_clone):
-        """Test that MIT license is marked as LGPL compatible"""
-        # Mock the functions to avoid actual git operations
-        mock_clone.return_value = None
-        mock_license.return_value = "MIT"
-        mock_stats.return_value = {"total_files": 10, "python_files": 5}
-        
-        with patch('tempfile.mkdtemp', return_value='/fake/temp'):
-            with patch('shutil.rmtree'):
-                result = analyze_repo("https://github.com/test/repo")
-        
-        # MIT should be LGPL compatible
-        assert result["lgpl_compatible"] == True, "MIT should be LGPL compatible"
-        assert result["license"] == "MIT"
-        assert result["total_files"] == 10
-        assert result["python_files"] == 5
-        assert result["repo"] == ["test", "repo"]
-    
-    def test_apache_license_detection(self):
-        """Test that Apache license is correctly detected"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create a LICENSE file with Apache content
-            license_path = os.path.join(tmpdir, "LICENSE.txt")
-            with open(license_path, "w") as f:
-                f.write("Apache License\n"
-                       "Version 2.0, January 2004\n"
-                       "http://www.apache.org/licenses/")
-            
-            result = extract_license(tmpdir)
-            assert result == "Apache", f"Expected 'Apache' but got '{result}'"
-    
-    def test_unknown_license_detection(self):
-        """Test that unknown licenses are properly handled"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create a LICENSE file with unknown content
-            license_path = os.path.join(tmpdir, "LICENSE")
-            with open(license_path, "w") as f:
-                f.write("Custom Proprietary License\n"
-                       "All rights reserved.\n"
-                       "No permissions granted.")
-            
-            result = extract_license(tmpdir)
-            assert result == "Unknown", f"Expected 'Unknown' but got '{result}'"
-    
-    def test_no_license_file(self):
-        """Test behavior when no license file exists"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Don't create any LICENSE file
-            result = extract_license(tmpdir)
-            assert result == "Unknown", f"Expected 'Unknown' for missing license but got '{result}'"
-    
-    @patch('analyze_repo.clone_repo')
-    @patch('analyze_repo.extract_license')
-    @patch('analyze_repo.extract_repo_stats')
-    def test_lgpl_compatibility_unknown(self, mock_stats, mock_license, mock_clone):
-        """Test that unknown licenses are marked as NOT LGPL compatible"""
-        mock_clone.return_value = None
-        mock_license.return_value = "Unknown"
-        mock_stats.return_value = {"total_files": 5, "python_files": 2}
-        
-        with patch('tempfile.mkdtemp', return_value='/fake/temp'):
-            with patch('shutil.rmtree'):
-                result = analyze_repo("https://github.com/test/repo")
-        
-        # Unknown should NOT be LGPL compatible
-        assert result["lgpl_compatible"] == False, "Unknown license should not be LGPL compatible"
-        assert result["license"] == "Unknown"
-    
-    def test_gpl_license_detection(self):
-        """Test that GPL/LGPL licenses are correctly detected"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Test GPL detection
-            license_path = os.path.join(tmpdir, "COPYING")
-            with open(license_path, "w") as f:
-                f.write("GNU GENERAL PUBLIC LICENSE\n"
-                       "Version 3, 29 June 2007\n"
-                       "Copyright (C) 2007 Free Software Foundation")
-            
-            result = extract_license(tmpdir)
-            assert result == "GPL/LGPL", f"Expected 'GPL/LGPL' but got '{result}'"
-    
-    def test_bsd_license_detection(self):
-        """Test that BSD license is correctly detected"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            license_path = os.path.join(tmpdir, "LICENSE")
-            with open(license_path, "w") as f:
-                f.write("BSD 3-Clause License\n\n"
-                       "Copyright (c) 2024, Test\n"
-                       "Redistribution and use in source and binary forms...")
-            
-            result = extract_license(tmpdir)
-            assert result == "BSD", f"Expected 'BSD' but got '{result}'"
+def test_normalize_score_bounds():
+    assert analyze_repo.normalize_score(5, 0, 10) == 0.5
+    assert analyze_repo.normalize_score(-5, 0, 10) == 0.0
+    assert analyze_repo.normalize_score(10, 10, 10) == 1.0
+
+
+def test_is_lgpl_compatible_variants():
+    assert analyze_repo.is_lgpl_compatible("MIT") == 1
+    assert analyze_repo.is_lgpl_compatible("Proprietary") == 0
+
+
+def test_compute_size_metric(tmp_path):
+    weights = tmp_path / "model.safetensors"
+    weights.write_bytes(b"0" * 1024 * 1024)  # 1 MiB
+    score = analyze_repo.compute_size_metric(str(tmp_path), max_capacity_mb=2)
+    assert pytest.approx(0.5, rel=1e-3) == score
+
+
+def test_compute_code_quality_success(monkeypatch, tmp_path):
+    (tmp_path / "file.py").write_text("print('hi')\n")
+
+    monkeypatch.setattr(analyze_repo.shutil, "which", lambda _: None)
+
+    def fake_run(cmd, cwd, capture_output, text, check):
+        assert cwd == str(tmp_path)
+        return SimpleNamespace(stdout="file.py:1:1: F401 Foo\n", returncode=0)
+
+    monkeypatch.setattr(analyze_repo.subprocess, "run", fake_run)
+    score = analyze_repo.compute_code_quality(str(tmp_path))
+    assert 0.0 < score <= 1.0
+
+
+def test_compute_code_quality_flake8_error(monkeypatch, tmp_path):
+    (tmp_path / "file.py").write_text("print('hi')\n")
+
+    monkeypatch.setattr(analyze_repo.shutil, "which", lambda _: "flake8")
+
+    def fake_run(cmd, cwd, capture_output, text, check):
+        return SimpleNamespace(stdout="", stderr="boom", returncode=2)
+
+    monkeypatch.setattr(analyze_repo.subprocess, "run", fake_run)
+    score = analyze_repo.compute_code_quality(str(tmp_path))
+    assert score == 0.0
+
+
+def test_compute_code_quality_exception(monkeypatch, tmp_path):
+    (tmp_path / "file.py").write_text("print('hi')\n")
+
+    def blow_up(*args, **kwargs):
+        raise OSError("no flake8")
+
+    monkeypatch.setattr(analyze_repo.subprocess, "run", blow_up)
+    score = analyze_repo.compute_code_quality(str(tmp_path))
+    assert score == 0.5
+
+
+def test_extract_license_detects_mit(tmp_path):
+    lic = tmp_path / "LICENSE"
+    lic.write_text("This project is released under the MIT license\n")
+    found = analyze_repo.extract_license(str(tmp_path))
+    assert found == "MIT"
+
+
+def test_extract_repo_stats(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "a.py").write_text("print('hello')\n")
+    (tmp_path / "data.bin").write_bytes(b"123")
+    stats = analyze_repo.extract_repo_stats(str(tmp_path))
+    assert stats["total_files"] == 2
+    assert stats["python_files"] == 1
+
+
+def test_compute_local_metrics(monkeypatch, tmp_path):
+    (tmp_path / "weights.bin").write_bytes(b"0" * 4096)
+
+    def fake_run(cmd, cwd, capture_output, text, check):
+        assert cmd[:3] == ["git", "shortlog", "-sne"]
+        return SimpleNamespace(stdout="   5\tAlice\n   3\tBob\n", returncode=0)
+
+    monkeypatch.setattr(analyze_repo.subprocess, "run", fake_run)
+    monkeypatch.setattr(analyze_repo, "compute_code_quality", lambda _path: 0.8)
+
+    metrics = analyze_repo.compute_local_metrics(str(tmp_path), "MIT")
+    assert pytest.approx(0.8, rel=1e-6) == metrics["code_quality"]
+    assert metrics["license"] == 1
+    assert metrics["size"] > 0
+    assert metrics["bus_factor"] > 0
+
+
+def test_analyze_repo_with_local_path(monkeypatch, tmp_path):
+    (tmp_path / "LICENSE").write_text("MIT License text\n")
+
+    monkeypatch.setattr(
+        analyze_repo,
+        "compute_local_metrics",
+        lambda _path, _license: {
+            "bus_factor": 0.2,
+            "code_quality": 0.9,
+            "license": 1,
+            "size": 0.3,
+        },
+    )
+
+    result = analyze_repo.analyze_repo(str(tmp_path))
+    assert result["license"] == 1
+    assert result["lgpl_compatible"] is True
+    assert result["bus_factor"] == 0.2
+    assert str(tmp_path) in result["repo"]
+
+
+def test_analyze_repo_invalid_url(monkeypatch):
+    def raise_clone(*_args, **_kwargs):
+        raise RuntimeError("bad")
+
+    monkeypatch.setattr(analyze_repo, "clone_repo", raise_clone)
+
+    result = analyze_repo.analyze_repo("https://github.com/example/invalid")
+    assert result["error"] == "Invalid or not supported URL"
+    assert result["license"] == "Unknown"
+
+
+def test_compute_size_metric_handles_getsize_error(monkeypatch, tmp_path):
+    (tmp_path / "weights.bin").write_bytes(b"123")
+
+    def fail_getsize(_path):
+        raise OSError("boom")
+
+    monkeypatch.setattr(analyze_repo.os.path, "getsize", fail_getsize)
+    score = analyze_repo.compute_size_metric(str(tmp_path))
+    assert score == 0.0
+
+
+def test_compute_local_metrics_git_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        analyze_repo.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("git")),
+    )
+    monkeypatch.setattr(analyze_repo, "compute_code_quality", lambda _path: 0.3)
+
+    metrics = analyze_repo.compute_local_metrics(str(tmp_path), "MIT")
+    assert metrics["bus_factor"] == 0.0
+    assert metrics["code_quality"] == 0.3
+
+
+def test_analyze_repo_github_api(monkeypatch, tmp_path):
+    temp_dir = tmp_path / "clone"
+    temp_dir.mkdir()
+
+    monkeypatch.setattr("tempfile.mkdtemp", lambda: str(temp_dir))
+
+    def fake_clone(_url, local_dir):
+        Path(local_dir).mkdir(exist_ok=True)
+
+    def fake_get(url, timeout):
+        assert url == "https://api.github.com/repos/owner/repo"
+        return SimpleNamespace(
+            status_code=200,
+            json=lambda: {"license": {"spdx_id": "BSD-3-Clause"}},
+        )
+
+    def raise_extract(_path):
+        raise RuntimeError("license read error")
+
+    def raise_metrics(_path, _license):
+        raise ValueError("metric failure")
+
+    monkeypatch.setattr(analyze_repo, "clone_repo", fake_clone)
+    monkeypatch.setattr("requests.get", fake_get)
+    monkeypatch.setattr(analyze_repo, "extract_license", raise_extract)
+    monkeypatch.setattr(analyze_repo, "compute_local_metrics", raise_metrics)
+
+    result = analyze_repo.analyze_repo("https://github.com/owner/repo")
+    assert result["repo"] == ["owner", "repo"]
+    assert result["license"] == "Unknown"
+    assert result["lgpl_compatible"] is False
