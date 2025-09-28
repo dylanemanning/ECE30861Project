@@ -3,8 +3,49 @@ import os
 import json
 import re
 import requests
-import HF_API_Integration as hf
-from genai_readme_analysis import analyze_metrics, discover_dataset_url_with_genai
+import importlib
+
+# Robust import for HF_API_Integration: try package import, then top-level, then relative.
+hf = None
+for modname in ("src.HF_API_Integration", "HF_API_Integration"):
+    try:
+        hf = importlib.import_module(modname)
+        break
+    except Exception:
+        hf = None
+        continue
+if hf is None:
+    try:
+        # Try relative import when running as package
+        hf = importlib.import_module(f".{'HF_API_Integration'}", package=__package__)
+    except Exception:
+        hf = None
+
+# Robust import for genai_readme_analysis
+gra = None
+for modname in ("src.genai_readme_analysis", "genai_readme_analysis"):
+    try:
+        gra = importlib.import_module(modname)
+        break
+    except Exception:
+        gra = None
+        continue
+if gra is None:
+    try:
+        gra = importlib.import_module(f".{ 'genai_readme_analysis' }", package=__package__)
+    except Exception:
+        gra = None
+
+if gra is None:
+    # fallback stubs to avoid runtime crashes; functions will raise if used
+    def analyze_metrics(*args, **kwargs):
+        raise ImportError("genai_readme_analysis not available")
+
+    def discover_dataset_url_with_genai(*args, **kwargs):
+        raise ImportError("genai_readme_analysis not available")
+else:
+    analyze_metrics = getattr(gra, "analyze_metrics")
+    discover_dataset_url_with_genai = getattr(gra, "discover_dataset_url_with_genai")
 
 
 def parse_triple(line: str) -> Tuple[str, str, str]:
