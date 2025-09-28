@@ -3,6 +3,8 @@ import os
 import subprocess
 from git import Repo  # pip install GitPython
 import math
+import shutil
+import sys
 
 # --- METRIC HELPERS ---
 def normalize_score(value, min_val, max_val):
@@ -27,7 +29,7 @@ def is_lgpl_compatible(license_str):
     ]
     return 1 if license_str in compatible_licenses else 0
 
-def compute_code_quality(repo_path: str) -> float:
+'''def compute_code_quality(repo_path: str) -> float:
     try:
         python_files = sum(
             1 for root, dirs, files in os.walk(repo_path) 
@@ -60,7 +62,46 @@ def compute_code_quality(repo_path: str) -> float:
         return max(0.0, min(1.0, score))
     except Exception as e:
         print(f"Error running flake8: {e}")
+        return 0.5'''
+
+def compute_code_quality(repo_path: str) -> float:
+    try:
+        python_files = sum(
+            1 for root, dirs, files in os.walk(repo_path) 
+            for file in files if file.endswith(".py")
+        )
+        print(f"Found {python_files} Python files.")
+
+        # Determine how to run flake8
+        flake8_path = shutil.which("flake8")
+        if flake8_path:
+            cmd = [flake8_path, "."]
+        else:
+            cmd = [sys.executable, "-m", "flake8", "."]
+
+        # Run flake8
+        result = subprocess.run(
+            cmd,  # pass the command here!
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+
+        issues = len(result.stdout.strip().splitlines())
+        if result.returncode != 0 and issues == 0:
+            # flake8 errored before reporting results
+            print("flake8 reported an error without lint output:", result.stderr.strip())
+            return 0.0
+        print(f"Found {issues} flake8 issues.")
+
+        avg_issues = issues / max(python_files, 1)
+        score = 1.0 - avg_issues / 150
+        return max(0.0, min(1.0, score))
+    except Exception as e:
+        print(f"Error running flake8: {e}")
         return 0.5
+
 
 
 def compute_size_metric(repo_path: str, max_capacity_mb: float = 16*1024) -> float:
@@ -129,7 +170,6 @@ def compute_local_metrics(repo_path, license_str=None):
 
     return {
         "bus_factor": bus_factor,
-        #"ramp_up_time": ramp_up_time,
         "code_quality": code_quality,
         "license": license_score,
         "size": size_score
@@ -311,6 +351,6 @@ if __name__ == "__main__":
         shutil.rmtree(temp_dir, ignore_errors=True)  # cleanup'''
 
     # Analyze the large repo using analyze_repo
-    test_repo = "https://huggingface.co/bigscience/bloom"
+    test_repo = "https://huggingface.co/google/gemma-3-270m/tree/main"
     info = analyze_repo(test_repo)
     print("analyze_repo result:", info)
