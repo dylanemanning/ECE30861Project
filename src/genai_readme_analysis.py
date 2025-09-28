@@ -10,32 +10,41 @@ def analyze_with_genai(readme: str = "", code: str = "", metadata: str = "", dat
     Call Purdue GenAI Studio to compute ONLY the metrics:
     - ramp_up_time, ramp_up_time_latency
     - performance_claims, performance_claims_latency
-    - dataset_and_code_score, dataset_and_code_score_latency
+    - bus_factor, bus_factor_latency
+    - dataset_quality, dataset_quality_latency
+    - code_quality, code_quality_latency
 
-    This call must NOT include dataset_url or dataset_quality.
+    This call must NOT include dataset_url or dataset_and_code_score.
     """
     api_key = os.environ.get("GEN_AI_STUDIO_API_KEY") or "sk-91a78299639b4da595d22241ca2161d0"
     prompt = (
-        "You are an expert evaluator. Return ONLY a JSON object with exactly these keys:\n"
+        "You are an expert evaluator. Return ONLY a JSON object with exactly these keys (all lower case):\n"
         "- ramp_up_time (float in [0,1])\n"
         "- ramp_up_time_latency (int milliseconds)\n"
         "- performance_claims (float in [0,1])\n"
         "- performance_claims_latency (int milliseconds)\n"
-        "- dataset_and_code_score (float in [0,1])\n"
-        "- dataset_and_code_score_latency (int milliseconds)\n\n"
-        "Metric Operationalization:\n"
+        "- bus_factor (float in [0,1])\n"
+        "- bus_factor_latency (int milliseconds)\n"
+        "- dataset_quality (float in [0,1])\n"
+        "- dataset_quality_latency (int milliseconds)\n"
+        "- code_quality (float in [0,1])\n"
+        "- code_quality_latency (int milliseconds)\n\n"
+        "Metric Operationalization: In all the below metric, 0 means the absolute worst and 1 means the best.\n"
         "- Ramp Up Time: Assess ease of getting started from README/tutorials/examples.\n"
         "- Performance Claims: Check README/paper claims and whether they cite/align with recognized benchmarks; score verified/credible claims higher.\n"
-        "- Dataset and Code Score: Presence and usability of dataset links and example code; score 1 if clearly documented and accessible, else lower.\n\n"
+        "- Bus Factor: Analyze Git commit history using a Git library (such as isomorphic-git). Compute knowledge concentration: number of commits per contributor. Normalize to [0, 1] where higher = spread across more contributors. Mitigates risk of knowledge loss if a key contributor leaves, as measurable via repository metadata.\n"
+        "- Dataset Quality:  For this metric, you are a strict software and dataset auditor; analyze the provided model documentation (README,model card) and assign harsh 0.0–1.0 scores that severely penalize missing, vague, or incomplete information, never guessing or rewarding absence. If a dataset link provided by user is present, fully evaluate its quality using the listed evaluation. If the link is missing, go to the provided model link and check the Model card for training data(dataset) info; if a valid training dataset info is found, proceed with evaluation, otherwise set the score to 0. Evaluation: Check the listed dataset used for the model, specifically the: size, completeness, labels, license. Assess for cleanliness, relevance, and proper formatting. Normalize score [0, 1] based on quality indicators.\n"
+        "- Code Quality: For this metric, you are a strict software and dataset auditor; analyze the provided model documentation (README,model card) and assign harsh 0.0–1.0 scores that severely penalize missing, vague, or incomplete information, never guessing or rewarding absence. If a code link is provided by user present, fully evaluate code quality using the listed evaluation. If the link is missing, go to the provided model link and check for code files in the Files and version; if files exist, proceed with evaluation, otherwise set the score to 0. Evaluation: Static analysis with flake8, mypy type checking, and PEP8 compliance. Optionally, run example scripts to detect runtime errors. Normalize score [0, 1] based on linting results and maintainability.\n\n"
         "Strict output rules:\n"
         "- Output ONLY JSON. No code fences, no commentary.\n"
-        "- Latencies must be integers in milliseconds.\n"
-        "- Do NOT include dataset URLs or dataset quality in this response.\n\n"
+        "- Latencies must be integers in milliseconds and rounded to zero decimal places.\n"
+        "- All metric names must be lower case and match exactly.\n"
+        "- Do NOT include dataset URLs in this response.\n\n"
         f"Model (may be a full HF URL or <owner>/<name>):\n{model}\n\n"
         "Context\n"
         f"README (may be empty):\n{readme}\n"
-        f"Code:\n{code}\n"
-        f"Metadata:\n{metadata}\n"
+        f"Code(may be empty; ignore for this response):\n{code}\n"
+        f"Metadata(may be empty; ignore for this response):\n{metadata}\n"
         f"Dataset Link provided by user (may be empty; ignore for this response):\n{dataset_link}\n"
     )
     url = "https://genai.rcac.purdue.edu/api/chat/completions"
@@ -70,33 +79,32 @@ def _parse_llm_content_to_json(content: str) -> Dict[str, Any]:
 
 def _flatten_metrics(m: Dict[str, Any]) -> Dict[str, Any]:
     """Flatten supported metrics into a flat dict: {key: float, key_latency: int}."""
-    allowed_scores = {"ramp_up_time", "performance_claims", "dataset_and_code_score"}
     flat: Dict[str, Any] = {}
     for key, val in m.items():
-        if key in allowed_scores:
-            if isinstance(val, dict):
-                score = val.get("score")
-                latency = val.get("latency")
-                if score is not None:
-                    try:
-                        flat[key] = float(score)
-                    except Exception:
-                        pass
-                if latency is not None:
-                    try:
-                        flat[f"{key}_latency"] = int(round(float(latency)))
-                    except Exception:
-                        pass
-            else:
+        # If value is a dict with score/latency, flatten it
+        if isinstance(val, dict):
+            score = val.get("score")
+            latency = val.get("latency")
+            if score is not None:
                 try:
-                    flat[key] = float(val)
+                    flat[key] = float(score)
                 except Exception:
                     pass
-        elif key.endswith("_latency") and key[:-8] in allowed_scores:
+            if latency is not None:
+                try:
+                    flat[f"{key}_latency"] = int(round(float(latency)))
+                except Exception:
+                    pass
+        elif key.endswith("_latency"):
             try:
                 flat[key] = int(round(float(val)))
             except Exception:
-                pass
+                flat[key] = val
+        else:
+            try:
+                flat[key] = float(val)
+            except Exception:
+                flat[key] = val
     return flat
 
 

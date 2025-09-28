@@ -1,9 +1,17 @@
-from typing import List, Tuple, Dict, Any
+from typing import Any
+from typing import List, Tuple, Dict
 import os
 import json
 import re
 import requests
+import sys
+import os
+# Ensure src is in sys.path for imports
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
 import HF_API_Integration as hf
+import genai_readme_analysis
 from genai_readme_analysis import analyze_metrics, discover_dataset_url_with_genai
 
 
@@ -55,112 +63,119 @@ def handle_input_file(path: str) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     triples = read_url_file(path)
 
+    def extract_model_id(url_or_id: str) -> str:
+        s = url_or_id.strip()
+        if s.startswith("https://huggingface.co/"):
+            path = s[len("https://huggingface.co/"):]
+            parts = [p for p in path.split("/") if p]
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+            elif len(parts) == 1:
+                return parts[0]
+            else:
+                return s
+        return s
+
     for code_url, dataset_url, model_url in triples:
-        raw_model = str(model_url or "").strip()
+        code_url = code_url.strip() if code_url else ""
+        dataset_url = dataset_url.strip() if dataset_url else ""
+        model_url = model_url.strip() if model_url else ""
+    # print(f"[DEBUG] Model: {model_url}")
+    # print(f"[DEBUG] code_url: {code_url}")
+    # print(f"[DEBUG] dataset_url: {dataset_url}")
 
-        def is_hf_model_url(u: str) -> bool:
-            return u.startswith("https://huggingface.co/") or ("/" in u and not u.startswith("http"))
+        # Extract model ID for HF API
+        model_id = extract_model_id(model_url)
+        license_info = hf.get_license_info(model_id)
+        compat_score = license_info.get("lgplv21_compat_score", 0)
+        # Ensure license_latency is integer milliseconds, rounded
+        raw_license_latency = license_info.get("license_latency", 0)
+        try:
+            license_latency = int(round(float(raw_license_latency) * 1000))
+        except Exception:
+            license_latency = 0
 
-        def is_github_url(u: str) -> bool:
-            return u.startswith("https://github.com/")
+        # Model name extraction: always use the second and third segment for Hugging Face URLs
+        def extract_model_name(url):
+            s = url.strip()
+            if s.startswith("https://huggingface.co/"):
+                parts = [p for p in s[len("https://huggingface.co/"):].split("/") if p]
+                if len(parts) >= 2:
+                    return parts[1]
+                elif len(parts) == 1:
+                    return parts[0]
+                else:
+                    return s
+            parts = s.split("/")
+            if parts[-1].lower() == "main" and len(parts) > 1:
+                return parts[-2]
+            return parts[-1]
 
-        def normalize_model_id_and_name(u: str) -> Tuple[str, str]:
-            # Returns (model_id_for_calls, display_name)
-            if not u:
-                return "", ""
-            if is_hf_model_url(u):
-                try:
-                    mid = hf._extract_model_id(u)  # type: ignore[attr-defined]
-                except Exception:
-                    mid = u
-                name = mid.split("/")[-1] if "/" in mid else mid
-                return mid, name
-            if is_github_url(u):
-                # https://github.com/{owner}/{repo}[/...]
-                path = u[len("https://github.com/"):]
-                parts = [p for p in path.split("/") if p]
-                repo = parts[1] if len(parts) >= 2 else parts[0] if parts else u
-                return u, repo
-            # Fallback: plain id or URL
-            return u, (u.split("/")[-1] if "/" in u else u)
+        name = extract_model_name(model_url)
 
-        def fetch_readme_text(u: str) -> str:
-            # Try HF README when it's an HF id/url
-            mid, _ = normalize_model_id_and_name(u)
-            if is_hf_model_url(u) or ("/" in mid and not mid.startswith("http")):
-                if hasattr(hf, "fetch_model_card_text"):
-                    txt = hf.fetch_model_card_text(mid)
-                    if txt:
-                        return txt
-            # GitHub README fallback
-            if is_github_url(u):
-                try:
-                    path = u[len("https://github.com/"):]
-                    parts = [p for p in path.split("/") if p]
-                    if len(parts) >= 2:
-                        owner, repo = parts[0], parts[1]
-                        for branch in ("main", "master"):
-                            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/README.md"
-                            resp = requests.get(raw_url, timeout=10)
-                            if resp.status_code == 200 and resp.text:
-                                return resp.text
-                except Exception:
-                    pass
-            return ""
-
-        model_id, display_name = normalize_model_id_and_name(raw_model)
-        readme_text = fetch_readme_text(raw_model)
-
-        # Normalize dataset URL and set flag
-        ds_input = dataset_url.strip() if dataset_url else ""
-        dataset_url_flag = not is_placeholder_or_non_hf_dataset(ds_input)
-        ds_url = ds_input if dataset_url_flag else ""
-
-        # GenAI metrics (always)
+        # All other metrics from GenAI, passing code and dataset URLs for relevant metrics
         metrics = analyze_metrics(
-            readme=readme_text,
-            code=code_url or "",
+            readme="",  # Optionally fetch README if needed
+            code=code_url,
             metadata="",
-            dataset_link=ds_url,
-            model=model_id,
+            dataset_link=dataset_url,
+            model=model_url,
         ) or {}
 
-        # Dataset quality path
-        dsq: Dict[str, Any] = {}
-        if dataset_url_flag and ds_url:
-            dsq = hf.fetch_dataset_quality(ds_url) if hasattr(hf, "fetch_dataset_quality") else {}
+        # Calculate dataset_and_code_score and latency based on code/dataset link presence
+        if code_url or dataset_url:
+            dataset_and_code_score = 1.0
+            dataset_and_code_score_latency = 1
         else:
-            # Discover dataset via GenAI if missing
-            disc = discover_dataset_url_with_genai(readme=readme_text, model=model_id) or {}
-            discovered = str(disc.get("dataset_url") or "").strip()
-            if discovered:
-                if not discovered.startswith("http") and "/" in discovered:
-                    discovered = f"https://huggingface.co/datasets/{discovered}"
-                if discovered.startswith("https://huggingface.co/datasets/"):
-                    dsq = hf.fetch_dataset_quality(discovered) if hasattr(hf, "fetch_dataset_quality") else {}
-
-        # Build output record
-        rec: Dict[str, Any] = {"name": display_name, "category": "MODEL"}
-        for k in [
-            "ramp_up_time",
-            "performance_claims",
-            "dataset_and_code_score",
-        ]:
-            if k in metrics:
-                rec[k] = metrics[k]
-            lat_k = f"{k}_latency"
-            if lat_k in metrics:
+            dataset_and_code_score = 0.0
+            dataset_and_code_score_latency = 1
+        dataset_quality = metrics.get("dataset_quality", None)
+        if dataset_quality is None:
+            dataset_quality = 0.0
+        code_quality = metrics.get("code_quality", None)
+        if code_quality is None:
+            code_quality = 0.0
+        dataset_quality_latency = metrics.get("dataset_quality_latency", None)
+        if dataset_quality_latency is None:
+            dataset_quality_latency = 0
+        code_quality_latency = metrics.get("code_quality_latency", None)
+        if code_quality_latency is None:
+            code_quality_latency = 0
+        # if not code_url and not dataset_url:
+        #     try:
+        #         dataset_quality = float(dataset_quality) * 0.1 if dataset_quality is not None else 0.0
+        #     except Exception:
+        #         dataset_quality = 0.0
+        # Round dataset_quality to 3 decimal places
+        try:
+            dataset_quality = round(float(dataset_quality), 3) if dataset_quality is not None else None
+        except Exception:
+            pass
+        rec: Dict[str, Any] = {
+            "name": name,
+            "category": "MODEL",
+            "license": 1 if compat_score else 0,
+            "license_latency": license_latency,
+            "bus_factor": metrics.get("bus_factor", None),
+            "bus_factor_latency": int(round(float(metrics.get("bus_factor_latency", 0)))) if "bus_factor_latency" in metrics else None,
+            "dataset_quality": dataset_quality,
+            "dataset_quality_latency": int(round(float(dataset_quality_latency))),
+            "code_quality": code_quality,
+            "code_quality_latency": int(round(float(code_quality_latency))),
+            "dataset_and_code_score": dataset_and_code_score,
+            "dataset_and_code_score_latency": dataset_and_code_score_latency,
+        }
+        # Add remaining GenAI metrics, rounding latency fields to int ms
+        for k, v in metrics.items():
+            if k in rec:
+                continue
+            if k.endswith("_latency"):
                 try:
-                    rec[lat_k] = int(metrics[lat_k])
+                    rec[k] = int(round(float(v)))
                 except Exception:
-                    pass
-        if dsq.get("dataset_quality") is not None:
-            rec["dataset_quality"] = dsq.get("dataset_quality")
-            if dsq.get("dataset_quality_latency") is not None:
-                try:
-                    rec["dataset_quality_latency"] = int(dsq.get("dataset_quality_latency") or 0)
-                except Exception:
-                    pass
+                    rec[k] = v
+            else:
+                rec[k] = v
         results.append(rec)
     return results
 

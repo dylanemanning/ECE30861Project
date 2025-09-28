@@ -5,9 +5,12 @@ def license_compat(model_id: str) -> dict:
     Fetch model info from Hugging Face and check LGPLv2.1 compatibility.
     Returns a dict with model_id, license, lgplv21_compat_score, and error (if any).
     """
+    import time
     url = f"https://huggingface.co/api/models/{model_id}"
+    start_time = time.time()
     try:
         resp = requests.get(url, timeout=10)
+        latency = time.time() - start_time
         resp.raise_for_status()
         data = resp.json()
         license_str = extract_license(data)
@@ -15,13 +18,16 @@ def license_compat(model_id: str) -> dict:
         return {
             "model_id": model_id,
             "license": license_str,
-            "lgplv21_compat_score": compat
+            "lgplv21_compat_score": 1 if compat else 0,
+            "license_latency": latency
         }
     except Exception as e:
+        latency = time.time() - start_time
         return {
             "model_id": model_id,
             "license": "error",
             "lgplv21_compat_score": 0,
+            "license_latency": latency,
             "error": str(e)
         }
 """
@@ -57,4 +63,4 @@ def is_lgpl_compatible(license_str: str) -> int:
     Return 1 if license is compatible with LGPLv2.1, else 0.
     Uses COMPATIBLE_LICENSES set.
     """
-    return 1 if license_str.lower() in COMPATIBLE_LICENSES else 0
+    return license_str.lower() in COMPATIBLE_LICENSES
