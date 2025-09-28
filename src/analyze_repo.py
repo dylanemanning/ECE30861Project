@@ -27,7 +27,10 @@ def is_lgpl_compatible(license_str):
         "BSD-2-Clause",
         "BSD-3-Clause"
     ]
-    return 1 if license_str in compatible_licenses else 0
+    if not license_str:
+        return 0
+    ls = str(license_str).strip().upper()
+    return 1 if any(ls == c.upper() for c in compatible_licenses) else 0
 
 '''def compute_code_quality(repo_path: str) -> float:
     try:
@@ -171,8 +174,8 @@ def compute_local_metrics(repo_path, license_str=None):
     return {
         "bus_factor": bus_factor,
         "code_quality": code_quality,
-        "license": license_score,
-        "size": size_score
+        "license_score": license_score,
+        "size": size_score,
     }
 
 # --- REPO ANALYSIS ---
@@ -212,7 +215,15 @@ def extract_license(local_dir: str) -> str:
                             return "MIT"
                         elif "apache" in content:
                             return "Apache"
-                        elif "gpl" in content or "lgpl" in content:
+                        # Match GPL/LGPL by common keywords (handles
+                        # 'GNU GENERAL PUBLIC LICENSE' wording as well as
+                        # shorter 'gpl'/'lgpl' mentions)
+                        elif (
+                            "gpl" in content
+                            or "lgpl" in content
+                            or "general public license" in content
+                            or "gnu" in content
+                        ):
                             return "GPL/LGPL"
                         elif "bsd" in content:
                             return "BSD"
@@ -269,6 +280,23 @@ def analyze_repo(repo_url: str) -> dict:
 
     temp_dir = tempfile.mkdtemp()
 
+    # Allow tests (and other code) to monkeypatch the top-level
+    # 'analyze_repo' module functions by preferring those if available.
+    try:
+        import importlib
+        top_mod = importlib.import_module("analyze_repo")
+    except Exception:
+        top_mod = None
+
+    if top_mod is not None:
+        clone_fn = getattr(top_mod, "clone_repo", clone_repo)
+        extract_license_fn = getattr(top_mod, "extract_license", extract_license)
+        extract_repo_stats_fn = getattr(top_mod, "extract_repo_stats", extract_repo_stats)
+    else:
+        clone_fn = clone_repo
+        extract_license_fn = extract_license
+        extract_repo_stats_fn = extract_repo_stats
+
     try:
         # Determine if repo_url is local path
         if os.path.exists(repo_url):
@@ -277,7 +305,7 @@ def analyze_repo(repo_url: str) -> dict:
             # Try to clone GitHub repo
             local_dir = temp_dir
             try:
-                clone_repo(repo_url, local_dir)
+                clone_fn(repo_url, local_dir)
             except Exception:
                 return {"repo": [repo_url], **default_metrics, "error": "Invalid or not supported URL"}
 
@@ -306,12 +334,21 @@ def analyze_repo(repo_url: str) -> dict:
         # Fallback: extract license from local files
         if license_type == "Unknown":
             try:
-                license_type = extract_license(local_dir)
+                license_type = extract_license_fn(local_dir)
             except Exception:
                 license_type = "Unknown"
 
+        # Extract basic repo stats (total_files, python_files) so callers
+        # can inspect repo size even when compute_local_metrics isn't
+        # available or when running in a mocked test environment.
+        try:
+            stats = extract_repo_stats_fn(local_dir)
+        except Exception:
+            stats = {}
+
         # Compute local metrics (bus_factor, code_quality, size)
         try:
+            # compute_local_metrics lives in this module; call directly
             metrics = compute_local_metrics(local_dir, license_type)
         except Exception:
             metrics = default_metrics
@@ -320,8 +357,11 @@ def analyze_repo(repo_url: str) -> dict:
         repo_info = {
             "repo": [repo_url] if not owner else [owner, repo_name],
             "license": license_type,
-            "lgpl_compatible": license_type in compatible_licenses
+            "lgpl_compatible": bool(is_lgpl_compatible(license_type)),
+            **(stats or {}),
         }
+        # Metrics (bus_factor, code_quality, size, license_score) may
+        # overlap with stats; update last so metric keys are present.
         repo_info.update(metrics)
         return repo_info
 
