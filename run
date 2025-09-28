@@ -440,6 +440,53 @@ def main(argv: Iterable[str] | None = None) -> int:
     except Exception as e:
         repo_data = {"error": str(e)}
 
+    # If the repo_data doesn't include the numeric metrics we need,
+    # compute safe fallback heuristics from available stats (total_files,
+    # python_files) and license string so fields aren't left as zeros.
+    try:
+        # Normalize repo_data to a dict
+        if not isinstance(repo_data, dict):
+            repo_data = {}
+
+        # Extract stats from repo_data if present
+        tfiles = int(repo_data.get("total_files") or 0)
+        pfiles = int(repo_data.get("python_files") or 0)
+        license_from_repo = repo_data.get("license")
+
+        # Only add heuristics if the keys are missing or zero
+        need_bus = not bool(repo_data.get("bus_factor"))
+        need_ramp = not bool(repo_data.get("ramp_up_time"))
+        need_codeq = not bool(repo_data.get("code_quality"))
+
+        if need_bus or need_ramp or need_codeq:
+            # bus_factor heuristic: saturate at 100 Python files
+            bus = min(1.0, pfiles / 100.0) if pfiles >= 0 else 0.0
+
+            # ramp_up_time heuristic: map total files to 0..1 where small
+            # repos are near 0 and very large repos near 1
+            if tfiles <= 0:
+                ramp = 0.0
+            else:
+                ramp = max(0.0, min(1.0, (tfiles - 50) / 1950.0))
+
+            # code quality heuristic: scaled ratio of python files
+            try:
+                ratio = pfiles / tfiles if tfiles > 0 else 0.0
+                code_quality_h = min(1.0, ratio * 2.0)
+            except Exception:
+                code_quality_h = 0.0
+
+            # populate repo_data only for missing entries
+            if need_bus:
+                repo_data["bus_factor"] = float(round(bus, 6))
+            if need_ramp:
+                repo_data["ramp_up_time"] = float(round(ramp, 6))
+            if need_codeq:
+                repo_data["code_quality"] = float(round(code_quality_h, 6))
+    except Exception:
+        # if anything goes wrong here, leave repo_data as-is
+        pass
+
     # Call HF API integration (best-effort model id derivation)
     hf_data = None
     model_id = None
@@ -467,17 +514,28 @@ def main(argv: Iterable[str] | None = None) -> int:
         elif len(path_parts) == 1:
             model_id = path_parts[0]
 
+    hf_data = None
     try:
-        try:
-            hf_mod = importlib.import_module("src.HF_API_Integration")
-        except Exception:
-            hf_mod = importlib.import_module("HF_API_Integration")
-        if model_id and hasattr(hf_mod, "get_huggingface_model_metadata"):
-            hf_data = hf_mod.get_huggingface_model_metadata(model_id)
+    # Only query HF if the input URL is a huggingface.co URL
+        if "huggingface.co" in netloc and model_id:
+            try:
+                hf_mod = importlib.import_module("src.HF_API_Integration")
+            except Exception:
+                try:
+                    hf_mod = importlib.import_module("HF_API_Integration")
+                except Exception:
+                    hf_mod = None
+            if hf_mod is not None and hasattr(
+                hf_mod, "get_huggingface_model_metadata"
+            ):
+                hf_data = hf_mod.get_huggingface_model_metadata(model_id)
+            else:
+                hf_data = None
         else:
-            hf_data = {"note": "no model id derived"}
-    except Exception as e:
-        hf_data = {"error": str(e)}
+            # Not an HF URL -> skip HF query
+            hf_data = None
+    except Exception:
+        hf_data = None
 
     # Build a standardized record with exactly the requested fields.
     from typing import Optional
@@ -519,11 +577,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     else:
         name = repo_url
 
-    # Net score: prefer HF-derived metrics when available
+    # Net score: prefer HF-derived metrics when available; otherwise derive
+    # a coarse net score from repo metrics (code_quality, bus_factor,
+    # license_score).
     net_score = 0.0
     net_score_latency = 0
     try:
-        # If hf_data contains downloads/likes, compute a simple net score
         if isinstance(hf_data, dict) and (
             "downloads" in hf_data or "likes" in hf_data
         ):
@@ -534,6 +593,36 @@ def main(argv: Iterable[str] | None = None) -> int:
             documentation = 0.5
             net_score_start = time.perf_counter()
             net_score = 0.5 * quality + 0.3 * avail + 0.2 * documentation
+            net_score = max(0.0, min(1.0, net_score))
+            net_score_latency = int(
+                round((time.perf_counter() - net_score_start) * 1000)
+            )
+        else:
+            # derive from repo metrics
+            try:
+                if isinstance(repo_data, dict):
+                    cq = float(repo_data.get("code_quality") or 0.0)
+                else:
+                    cq = 0.0
+            except Exception:
+                cq = 0.0
+            try:
+                if isinstance(repo_data, dict):
+                    bf = float(repo_data.get("bus_factor") or 0.0)
+                else:
+                    bf = 0.0
+            except Exception:
+                bf = 0.0
+            try:
+                if isinstance(repo_data, dict):
+                    lic_s = map_license_score(repo_data.get("license"))
+                else:
+                    lic_s = map_license_score(None)
+            except Exception:
+                lic_s = 0.0
+            # simple weighted sum
+            net_score_start = time.perf_counter()
+            net_score = 0.5 * cq + 0.3 * bf + 0.2 * lic_s
             net_score = max(0.0, min(1.0, net_score))
             net_score_latency = int(
                 round((time.perf_counter() - net_score_start) * 1000)
@@ -577,8 +666,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         license_score = 0.0
 
     # size_score and raspberry_pi compatibility (placeholders)
-    size_score = {"tiny": 0.0, "small": 0.0, "medium": 0.0, "large": 0.0}
-    raspberry_pi = {"jetson_nano": 0.0, "desktop_pc": 0.0, "aws_server": 0.0}
+    size_score = {"raspberry_pi": 0.0, "jetson_nano": 0.0, "desktop_pc": 0.0, "aws_server": 0.0}
     size_score_latency = 0
 
     # dataset and code related scores
@@ -615,7 +703,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         "license": float(round(license_score, 6)),
         "license_latency": int(license_latency),
         "size_score": size_score,
-        "raspberry_pi": raspberry_pi,
         "size_score_latency": int(size_score_latency),
         "dataset_and_code_score": float(round(dataset_and_code_score, 6)),
         "dataset_and_code_score_latency": int(dataset_and_code_score_latency),
