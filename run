@@ -1,271 +1,369 @@
 #!/usr/bin/env python3
-"""Top-level runner script for model evaluation tool.
+"""Top-level runner script.
 
 Usage:
-  ./run install   # installs requirements
-  ./run test      # runs test suite
+  ./run install   # installs requirements with pip --user
+  ./run test      # runs pytest with coverage and prints summary
   ./run <url-file> # analyzes URLs and outputs NDJSON
 """
 from __future__ import annotations
 
 import argparse
-import json
-import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
+from typing import Iterable, Tuple, List
+import json
 import time
-from pathlib import Path
-from typing import Dict, Any, List, Tuple
+import urllib.parse as urlparse
+import importlib
+import tempfile
+import shutil
+import logging
 
-# Add src to path for imports
-ROOT = Path(__file__).parent.absolute()
-SRC_DIR = ROOT / "src"
-sys.path.insert(0, str(SRC_DIR))
+ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# Import after path setup
-try:
-    from url_handler import handle_input_file
-except ImportError:
-    # Fallback import
-    import url_handler
+def run_install() -> int:
+    req = os.path.join(ROOT, "requirements.txt")
+    if not os.path.exists(req):
+        print("requirements.txt not found", file=sys.stderr)
+        return 1
+    cmd = [sys.executable, "-m", "pip", "install", "--user", "-r", req]
+    proc = subprocess.run(cmd)
+    return 0 if proc.returncode == 0 else 1
 
+def parse_pytest_output(text: str) -> Tuple[int, int, float]:
+    passed = 0
+    cov = 0.0
+    counts = {
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+    }
 
-def setup_logging() -> None:
-    """Configure logging based on environment variables."""
-    log_file = os.environ.get("LOG_FILE", "")
+    summary_line = ""
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.search(
+            r"\b(passed|failed|error|errors|skipped|xfailed|xpassed)\b",
+            stripped,
+        ):
+            summary_line = stripped
+            break
+
+    if summary_line:
+        label_map = {
+            "passed": "passed",
+            "failed": "failed",
+            "error": "errors",
+            "errors": "errors",
+            "skipped": "skipped",
+            "xfailed": "xfailed",
+            "xpassed": "xpassed",
+        }
+        for count, label in re.findall(r"(\d+)\s+([A-Za-z]+)", summary_line):
+            lower_label = label.lower()
+            key = label_map.get(lower_label)
+            if key:
+                counts[key] += int(count)
+    passed = counts["passed"]
+    total = (
+        counts["passed"]
+        + counts["failed"]
+        + counts["errors"]
+        + counts["skipped"]
+        + counts["xfailed"]
+        + counts["xpassed"]
+    )
+    m3 = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", text)
+    if m3:
+        cov = float(m3.group(1))
+    else:
+        m4 = re.search(r"\b(\d+)%\s*covered", text)
+        if m4:
+            cov = float(m4.group(1))
+    return passed, total, cov
+
+def run_tests() -> int:
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "--disable-warnings",
+        "--cov=src",
+        "--cov-report=term",
+    ]
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    output = proc.stdout or ""
+    passed, total, cov = parse_pytest_output(output)
+    if total == 0:
+        if proc.returncode == 0:
+            total = passed
+        else:
+            m = re.search(r"(\d+) failed", output)
+            if m:
+                total = int(m.group(1)) + passed
+            else:
+                total = max(passed, 0)
+    
+    # EXACT format required by autograder (with period at end)
+    print(f"{passed}/{total} test cases passed. {int(cov)}% line coverage achieved.")
+    
+    return 0 if proc.returncode == 0 else 1
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="run")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        help="install | test | <url-file>",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        help=("Output NDJSON path when analyzing a repo"),
+    )
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help=("Pretty-print JSON instead of compact NDJSON"),
+    )
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    # Configure logging based on environment variables
+    LOG_FILE = os.environ.get("LOG_FILE", "")
     try:
-        log_level = int(os.environ.get("LOG_LEVEL", "0"))
-    except (ValueError, TypeError):
-        log_level = 0
-
-    if log_file:
+        LOG_LEVEL = int(os.environ.get("LOG_LEVEL", "0"))
+    except Exception:
+        LOG_LEVEL = 0
+    
+    # Clamp to allowed range
+    LOG_LEVEL = max(0, min(2, LOG_LEVEL))
+    
+    # Setup logging
+    if LOG_FILE:
         # Ensure directory exists
-        log_dir = os.path.dirname(log_file)
+        log_dir = os.path.dirname(LOG_FILE)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
         
-        if log_level == 0:
+        if LOG_LEVEL == 0:
             # Create empty file for silent mode
-            with open(log_file, 'w') as f:
-                pass
+            open(LOG_FILE, 'w').close()
+            # Set up null handler for logger
+            logger = logging.getLogger("run")
+            logger.addHandler(logging.NullHandler())
         else:
-            # Configure logging
-            level = logging.INFO if log_level == 1 else logging.DEBUG
-            logging.basicConfig(
-                filename=log_file,
-                filemode='w',  # Overwrite each run
-                level=level,
-                format='%(asctime)s %(levelname)s %(message)s',
-                datefmt='%Y-%m-%dT%H:%M:%SZ'
+            # Set up actual logging
+            logger = logging.getLogger("run")
+            logger.propagate = False
+            logger.setLevel(logging.DEBUG)
+            
+            fh = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
+            if LOG_LEVEL == 1:
+                fh.setLevel(logging.INFO)
+            else:  # LOG_LEVEL == 2
+                fh.setLevel(logging.DEBUG)
+            
+            fmt = logging.Formatter(
+                "%(asctime)s %(levelname)s %(message)s",
+                "%Y-%m-%dT%H:%M:%SZ"
             )
-            
-            # Also set levels for specific loggers
-            for logger_name in ['url_handler', 'HF_API_Integration', 'run']:
-                logger = logging.getLogger(logger_name)
-                logger.setLevel(level)
-
-
-def run_install() -> int:
-    """Install dependencies."""
-    req_file = ROOT / "requirements.txt"
-    if not req_file.exists():
-        print("requirements.txt not found", file=sys.stderr)
-        return 1
-    
-    cmd = [sys.executable, "-m", "pip", "install", "--user", "-r", str(req_file)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print("Installation failed:", result.stderr, file=sys.stderr)
-        return 1
-    return 0
-
-
-def run_tests() -> int:
-    """Run test suite and print results in exact required format."""
-    # Run pytest with coverage
-    cmd = [
-        sys.executable, "-m", "pytest",
-        "tests/",  # Test directory
-        "--cov=src",
-        "--cov-report=term",
-        "-v",
-        "--tb=short",
-        "--no-header",
-        "--disable-warnings"
-    ]
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        print("0/0 test cases passed. 0% line coverage achieved.")
-        return 1
-    except Exception as e:
-        print(f"0/0 test cases passed. 0% line coverage achieved.")
-        return 1
-    
-    output = result.stdout + result.stderr
-    
-    # Count test results
-    passed = 0
-    failed = 0
-    errors = 0
-    
-    # Look for pytest summary line (e.g., "== 25 passed, 2 failed ==")
-    summary_match = re.search(
-        r'=+\s*(\d+)\s+passed(?:,\s*(\d+)\s+failed)?(?:,\s*(\d+)\s+error)?',
-        output
-    )
-    
-    if summary_match:
-        passed = int(summary_match.group(1) or 0)
-        failed = int(summary_match.group(2) or 0)
-        errors = int(summary_match.group(3) or 0)
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
     else:
-        # Fallback: count individual test results
-        passed = len(re.findall(r'\s+PASSED', output))
-        failed = len(re.findall(r'\s+FAILED', output))
-        errors = len(re.findall(r'\s+ERROR', output))
-    
-    total = passed + failed + errors
-    
-    # Extract coverage percentage
-    coverage = 0
-    cov_match = re.search(r'TOTAL\s+\d+\s+\d+\s+(\d+)%', output)
-    if cov_match:
-        coverage = int(cov_match.group(1))
-    else:
-        # Alternative format
-        cov_match = re.search(r'TOTAL.*?(\d+)%', output)
-        if cov_match:
-            coverage = int(cov_match.group(1))
-    
-    # Print in EXACT required format
-    print(f"{passed}/{total} test cases passed. {coverage}% line coverage achieved.")
-    
-    # Return 0 only if all tests passed
-    return 0 if failed == 0 and errors == 0 else 1
+        logger = logging.getLogger("run")
+        logger.addHandler(logging.NullHandler())
 
+    if not args.command:
+        parser.print_help()
+        return 2
 
-def process_url_file(filepath: str) -> int:
-    """Process URL file and output NDJSON for models only."""
-    try:
-        # Use url_handler to process the file
-        results = handle_input_file(filepath)
+    if args.command == "install":
+        return run_install()
+    if args.command == "test":
+        return run_tests()
+
+    # Process URL file
+    if os.path.isfile(args.command):
+        url_file = args.command
         
-        if not results:
-            # Empty results, but not an error
-            return 0
-        
-        # Output NDJSON for MODEL entries only
-        for record in results:
-            # Only output MODEL category entries
-            if record.get("category", "").upper() != "MODEL":
-                continue
+        # Import url_handler
+        try:
+            sys.path.insert(0, str(os.path.join(ROOT, "src")))
+            import url_handler as uh
+        except ImportError as e:
+            print(f"Failed importing url_handler: {e}", file=sys.stderr)
+            return 3
+
+        try:
+            metrics_list = uh.handle_input_file(url_file) or []
+            logger.debug(f"Got {len(metrics_list)} records from url_handler")
+        except Exception as e:
+            print(f"url_handler.handle_input_file failed: {e}", file=sys.stderr)
+            logger.error(f"url_handler.handle_input_file failed: {e}")
+            return 1
+
+        # Also read raw triples to determine which are models
+        try:
+            triples = uh.read_url_file(url_file)
+        except Exception:
+            triples = []
+
+        logger.info(f"Processing {len(metrics_list)} records from {url_file}")
+
+        # Process each record
+        models_out = []
+        for idx, rec in enumerate(metrics_list):
+            triple = triples[idx] if idx < len(triples) else ("", "", "")
+            code_url, dataset_url, model_url = triple
+
+            # Extract values with proper defaults
+            def _get_num(key, default=0.0):
+                v = rec.get(key)
+                try:
+                    return float(v) if v is not None else float(default)
+                except Exception:
+                    return float(default)
+
+            def _get_int(key, default=0):
+                v = rec.get(key)
+                try:
+                    return int(v) if v is not None else int(default)
+                except Exception:
+                    return int(default)
+
+            name = rec.get("name") or model_url or ""
+            category = rec.get("category") or "MODEL"
+
+            # Extract all component scores
+            ramp_up_time = _get_num("ramp_up_time", 0.0)
+            ramp_up_time_latency = _get_int("ramp_up_time_latency", 0)
+            bus_factor = _get_num("bus_factor", 0.0)
+            bus_factor_latency = _get_int("bus_factor_latency", 0)
+            performance_claims = _get_num("performance_claims", 0.0)
+            performance_claims_latency = _get_int("performance_claims_latency", 0)
+            dataset_and_code_score = _get_num("dataset_and_code_score", 0.0)
+            dataset_and_code_score_latency = _get_int("dataset_and_code_score_latency", 0)
+            dataset_quality = _get_num("dataset_quality", 0.0)
+            dataset_quality_latency = _get_int("dataset_quality_latency", 0)
+            code_quality = _get_num("code_quality", 0.0)
+            code_quality_latency = _get_int("code_quality_latency", 0)
             
-            # Ensure all required fields with correct types
-            output_record = {
-                "name": str(record.get("name", "")),
-                "category": "MODEL",
-                "net_score": float(record.get("net_score", 0.0)),
-                "net_score_latency": int(record.get("net_score_latency", 0)),
-                "ramp_up_time": float(record.get("ramp_up_time", 0.0)),
-                "ramp_up_time_latency": int(record.get("ramp_up_time_latency", 0)),
-                "bus_factor": float(record.get("bus_factor", 0.0)),
-                "bus_factor_latency": int(record.get("bus_factor_latency", 0)),
-                "performance_claims": float(record.get("performance_claims", 0.0)),
-                "performance_claims_latency": int(record.get("performance_claims_latency", 0)),
-                "license": float(record.get("license", 0.0)),
-                "license_latency": int(record.get("license_latency", 0)),
-                "size_score": record.get("size_score", {
+            # License score (this should be from url_handler)
+            license_score = _get_num("license", 0.0)
+            license_latency = _get_int("license_latency", 0)
+            
+            # Size score
+            size_score = rec.get("size_score")
+            if not isinstance(size_score, dict):
+                size_score = {
                     "raspberry_pi": 0.0,
                     "jetson_nano": 0.0,
                     "desktop_pc": 0.0,
-                    "aws_server": 0.0
-                }),
-                "size_score_latency": int(record.get("size_score_latency", 0)),
-                "dataset_and_code_score": float(record.get("dataset_and_code_score", 0.0)),
-                "dataset_and_code_score_latency": int(record.get("dataset_and_code_score_latency", 0)),
-                "dataset_quality": float(record.get("dataset_quality", 0.0)),
-                "dataset_quality_latency": int(record.get("dataset_quality_latency", 0)),
-                "code_quality": float(record.get("code_quality", 0.0)),
-                "code_quality_latency": int(record.get("code_quality_latency", 0))
-            }
-            
-            # Ensure size_score values are floats
-            if isinstance(output_record["size_score"], dict):
+                    "aws_server": 0.0,
+                }
+            else:
+                # Ensure all keys exist and are floats
                 for device in ["raspberry_pi", "jetson_nano", "desktop_pc", "aws_server"]:
-                    if device in output_record["size_score"]:
-                        output_record["size_score"][device] = float(
-                            output_record["size_score"][device]
-                        )
-                    else:
-                        output_record["size_score"][device] = 0.0
+                    size_score[device] = float(size_score.get(device, 0.0))
             
-            # Output as single-line NDJSON
-            print(json.dumps(output_record, ensure_ascii=False))
-        
+            size_score_latency = _get_int("size_score_latency", 0)
+
+            # Calculate NetScore: license as multiplier, not component
+            try:
+                start_net = time.perf_counter()
+                
+                # Average size score across devices
+                size_scalar = sum(size_score.values()) / len(size_score) if size_score else 0.0
+                
+                # Weighted sum of components (weights sum to 1.0)
+                components_score = (
+                    0.18 * float(size_scalar) +
+                    0.12 * float(ramp_up_time) +
+                    0.12 * float(bus_factor) +
+                    0.18 * float(dataset_and_code_score) +
+                    0.12 * float(dataset_quality) +
+                    0.12 * float(code_quality) +
+                    0.16 * float(performance_claims)
+                )
+                
+                # Apply license as multiplier
+                net_score = float(license_score) * float(components_score)
+                net_score = max(0.0, min(1.0, net_score))
+                net_score_latency = int(round((time.perf_counter() - start_net) * 1000))
+            except Exception as e:
+                logger.error(f"NetScore calculation failed: {e}")
+                net_score = 0.0
+                net_score_latency = 0
+
+            final = {
+                "name": name,
+                "category": category,
+                "net_score": float(round(net_score, 6)),
+                "net_score_latency": int(net_score_latency),
+                "ramp_up_time": float(round(ramp_up_time, 6)),
+                "ramp_up_time_latency": int(ramp_up_time_latency),
+                "bus_factor": float(round(bus_factor, 6)),
+                "bus_factor_latency": int(bus_factor_latency),
+                "performance_claims": float(round(performance_claims, 6)),
+                "performance_claims_latency": int(performance_claims_latency),
+                "license": float(round(license_score, 6)),
+                "license_latency": int(license_latency),
+                "size_score": size_score,
+                "size_score_latency": int(size_score_latency),
+                "dataset_and_code_score": float(round(dataset_and_code_score, 6)),
+                "dataset_and_code_score_latency": int(dataset_and_code_score_latency),
+                "dataset_quality": float(round(dataset_quality, 6)),
+                "dataset_quality_latency": int(dataset_quality_latency),
+                "code_quality": float(round(code_quality, 6)),
+                "code_quality_latency": int(code_quality_latency),
+            }
+
+            models_out.append(final)
+
+        # Output NDJSON for models only
+        use_stdout = not args.output
+        if use_stdout:
+            out_fp = sys.stdout
+        else:
+            out_fp = open(args.output, "w", encoding="utf-8")
+
+        emitted = 0
+        for idx, final in enumerate(models_out):
+            # Check if this is a model URL
+            triple = triples[idx] if idx < len(triples) else ("", "", "")
+            code_url, dataset_url, model_url = triple
+            
+            # Only emit if it's a model
+            if model_url or final.get("category", "").upper() == "MODEL":
+                if args.pretty:
+                    out_fp.write(json.dumps(final, ensure_ascii=False, indent=2))
+                    out_fp.write("\n")
+                else:
+                    out_fp.write(json.dumps(final, ensure_ascii=False))
+                    out_fp.write("\n")
+                emitted += 1
+
+        if not use_stdout:
+            out_fp.close()
+
+        logger.info(f"Emitted {emitted} model records")
         return 0
-        
-    except FileNotFoundError:
-        print(f"Error: File {filepath} not found", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"Error processing URL file: {e}", file=sys.stderr)
-        logging.error(f"Error processing URL file: {e}")
-        return 1
 
-
-def main(argv: List[str] = None) -> int:
-    """Main entry point."""
-    # Set up logging first
-    setup_logging()
-    logger = logging.getLogger("run")
-    
-    # Parse arguments
-    parser = argparse.ArgumentParser(prog="run", add_help=False)
-    parser.add_argument("command", nargs="?")
-    parser.add_argument("--output", "-o", help=argparse.SUPPRESS)
-    parser.add_argument("--pretty", action="store_true", help=argparse.SUPPRESS)
-    
-    try:
-        args = parser.parse_args(argv)
-    except SystemExit:
-        return 2
-    
-    if not args.command:
-        print("Usage: ./run [install|test|URL_FILE]", file=sys.stderr)
-        return 2
-    
-    # Log the command
-    logger.info(f"Running command: {args.command}")
-    
-    # Handle commands
-    if args.command == "install":
-        logger.info("Running install")
-        return run_install()
-    
-    elif args.command == "test":
-        logger.info("Running tests")
-        return run_tests()
-    
-    elif os.path.isfile(args.command):
-        # Process URL file
-        logger.info(f"Processing URL file: {args.command}")
-        return process_url_file(args.command)
-    
-    else:
-        print(f"Error: Unknown command or file not found: {args.command}", file=sys.stderr)
-        return 1
-
+    # Single URL mode (not a file)
+    print(f"Error: File not found: {args.command}", file=sys.stderr)
+    return 1
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except Exception as e:
-        print(f"Fatal error: {e}", file=sys.stderr)
-        sys.exit(1)
+    raise SystemExit(main())
