@@ -1,4 +1,3 @@
-
 from license_compat import license_compat
 
 def get_license_info(model_id: str) -> dict:
