@@ -364,7 +364,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     "aws_server": float(merged_analysis.get("aws_server", 0.0) or 0.0),
                 }
             # size_score_latency may be reported under several keys; try them
-            size_score_latency = _get_int("size_score_latency", merged_analysis.get("size_latency") or 0)
+            size_score_latency = _get_int("size_score_latency", 0)
 
             dataset_and_code_score = _get_num("dataset_and_code_score", 0.0)
             dataset_and_code_score_latency = _get_int("dataset_and_code_score_latency", 0)
