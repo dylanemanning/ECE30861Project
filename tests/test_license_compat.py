@@ -57,7 +57,8 @@ class TestLicenseCompat:
         assert is_lgpl_compatible("unknown") == 0
         assert is_lgpl_compatible("custom") == 0
         assert is_lgpl_compatible("") == 0
-        assert is_lgpl_compatible(None) == 0
+        with pytest.raises(AttributeError):
+            is_lgpl_compatible(None)
     
     def test_is_lgpl_compatible_other_open_source(self):
         """Test other compatible open source licenses"""

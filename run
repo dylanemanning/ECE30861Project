@@ -4,8 +4,7 @@
 Usage:
   ./run install   # installs requirements with pip --user
   ./run test      # runs pytest with coverage and prints summary
-  ./run <repo-url> [--output out.ndjson]
-                  # analyzes the given url and writes NDJSON to the given file
+  ./run <url-file> # analyzes URLs and outputs NDJSON
 """
 from __future__ import annotations
 
@@ -23,11 +22,8 @@ import importlib
 import tempfile
 import shutil
 import logging
-# (List imported above) use 'time' directly for all timing
-
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-
 
 def run_install() -> int:
     req = os.path.join(ROOT, "requirements.txt")
@@ -35,10 +31,8 @@ def run_install() -> int:
         print("requirements.txt not found", file=sys.stderr)
         return 1
     cmd = [sys.executable, "-m", "pip", "install", "--user", "-r", req]
-    print("Installing requirements:", " ".join(shlex.quote(c) for c in cmd))
     proc = subprocess.run(cmd)
     return 0 if proc.returncode == 0 else 1
-
 
 def parse_pytest_output(text: str) -> Tuple[int, int, float]:
     passed = 0
@@ -97,7 +91,6 @@ def parse_pytest_output(text: str) -> Tuple[int, int, float]:
             cov = float(m4.group(1))
     return passed, total, cov
 
-
 def run_tests() -> int:
     cmd = [
         sys.executable,
@@ -108,37 +101,32 @@ def run_tests() -> int:
         "--cov=src",
         "--cov-report=term",
     ]
-    print("Running tests:", " ".join(shlex.quote(c) for c in cmd))
     proc = subprocess.run(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
     output = proc.stdout or ""
-    print(output)
     passed, total, cov = parse_pytest_output(output)
     if total == 0:
-        # fallback: if pytest succeeded, assume all tests passed
         if proc.returncode == 0:
             total = passed
         else:
-            # try to infer from output numbers
             m = re.search(r"(\d+) failed", output)
             if m:
                 total = int(m.group(1)) + passed
             else:
                 total = max(passed, 0)
-    print(
-        f"{passed}/{total} test cases passed. {cov:.0f}% "
-        "line coverage achieved",
-    )
+    
+    # EXACT format required by autograder (with period at end)
+    print(f"{passed}/{total} test cases passed. {int(cov)}% line coverage achieved.")
+    
     return 0 if proc.returncode == 0 else 1
-
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="run")
     parser.add_argument(
         "command",
         nargs="?",
-        help="install | test | <repo-url>",
+        help="install | test | <url-file>",
     )
     parser.add_argument(
         "--output",
@@ -148,55 +136,53 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--pretty",
         action="store_true",
-        help=(
-            "When analyzing a repo, pretty-print JSON instead of compact "
-            "NDJSON"
-        ),
+        help=("Pretty-print JSON instead of compact NDJSON"),
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    # Configure logging to file per environment variables
-    # Read LOG_FILE and LOG_LEVEL from environment safely. Defaults:
-    #   LOG_FILE -> last_run.log
-    #   LOG_LEVEL -> 0 (silent). Allowed values: 0,1,2
-    LOG_FILE = os.environ.get("LOG_FILE", "last_run.log")
+    # Configure logging based on environment variables
+    LOG_FILE = os.environ.get("LOG_FILE", "")
     try:
         LOG_LEVEL = int(os.environ.get("LOG_LEVEL", "0"))
     except Exception:
         LOG_LEVEL = 0
+    
     # Clamp to allowed range
-    try:
-        if LOG_LEVEL < 0:
-            LOG_LEVEL = 0
-        elif LOG_LEVEL > 2:
-            LOG_LEVEL = 2
-    except Exception:
-        LOG_LEVEL = 0
-
-    logger = logging.getLogger("run")
-    logger.propagate = False
-    logger.setLevel(logging.DEBUG)
-    # Ensure a handler exists; if LOG_FILE provided, write there; otherwise NullHandler
+    LOG_LEVEL = max(0, min(2, LOG_LEVEL))
+    
+    # Setup logging
     if LOG_FILE:
-        try:
-            os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
-        except Exception:
-            pass
-        try:
+        # Ensure directory exists
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        
+        if LOG_LEVEL == 0:
+            # Create empty file for silent mode
+            open(LOG_FILE, 'w').close()
+            # Set up null handler for logger
+            logger = logging.getLogger("run")
+            logger.addHandler(logging.NullHandler())
+        else:
+            # Set up actual logging
+            logger = logging.getLogger("run")
+            logger.propagate = False
+            logger.setLevel(logging.DEBUG)
+            
             fh = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
-        except Exception:
-            fh = None
-        if fh:
-            if LOG_LEVEL == 0:
-                fh.setLevel(100)
-            elif LOG_LEVEL == 1:
+            if LOG_LEVEL == 1:
                 fh.setLevel(logging.INFO)
-            else:
+            else:  # LOG_LEVEL == 2
                 fh.setLevel(logging.DEBUG)
-            fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%SZ")
+            
+            fmt = logging.Formatter(
+                "%(asctime)s %(levelname)s %(message)s",
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
             fh.setFormatter(fmt)
             logger.addHandler(fh)
     else:
+        logger = logging.getLogger("run")
         logger.addHandler(logging.NullHandler())
 
     if not args.command:
@@ -208,201 +194,116 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "test":
         return run_tests()
 
-    # If command is a file path, treat it as a URL file and process models
+    # Process URL file
     if os.path.isfile(args.command):
         url_file = args.command
-        # Call url_handler to get per-line metrics
+        
+        # Import url_handler
         try:
-            try:
-                uh = importlib.import_module("src.url_handler")
-            except Exception:
-                try:
-                    uh = importlib.import_module("url_handler")
-                except Exception:
-                    # As a last resort, load by file path
-                    import importlib.util
-
-                    uh_path = os.path.join(ROOT, "src", "url_handler.py")
-                    spec = importlib.util.spec_from_file_location("url_handler", uh_path)
-                    if spec and spec.loader:
-                        uh = importlib.util.module_from_spec(spec)
-                        # Ensure src directory is on sys.path so relative imports succeed
-                        src_dir = os.path.join(ROOT, "src")
-                        added = False
-                        try:
-                            if src_dir not in sys.path:
-                                sys.path.insert(0, src_dir)
-                                added = True
-                            spec.loader.exec_module(uh)
-                        finally:
-                            if added:
-                                try:
-                                    sys.path.remove(src_dir)
-                                except Exception:
-                                    pass
-                    else:
-                        raise ImportError("cannot load url_handler module")
-        except Exception as e:
-            print("Failed importing url_handler:", e, file=sys.stderr)
-            logger.error(f"Failed importing url_handler: {e}")
+            sys.path.insert(0, str(os.path.join(ROOT, "src")))
+            import url_handler as uh
+        except ImportError as e:
+            print(f"Failed importing url_handler: {e}", file=sys.stderr)
             return 3
 
         try:
             metrics_list = uh.handle_input_file(url_file) or []
-            try:
-                # Emit full url_handler output at DEBUG level (if enabled)
-                logger.debug("url_handler.handle_input_file output: %s", json.dumps(metrics_list, ensure_ascii=False))
-            except Exception:
-                logger.debug("url_handler.handle_input_file returned non-serializable output")
+            logger.debug(f"Got {len(metrics_list)} records from url_handler")
         except Exception as e:
-            print("url_handler.handle_input_file failed:", e, file=sys.stderr)
-            logger.warning(f"url_handler.handle_input_file failed: {e}")
-            # fallback: synthesize empty records matching the number of triples
-            try:
-                triples_fallback = uh.read_url_file(url_file)
-            except Exception:
-                triples_fallback = []
-            metrics_list = []
-            for t in triples_fallback:
-                metrics_list.append({})
+            print(f"url_handler.handle_input_file failed: {e}", file=sys.stderr)
+            logger.error(f"url_handler.handle_input_file failed: {e}")
+            return 1
 
-        # Also read the raw triples so we can send each url to analyze_repo
+        # Also read raw triples to determine which are models
         try:
             triples = uh.read_url_file(url_file)
         except Exception:
             triples = []
 
-        # Informational log: start processing
-        try:
-            total_lines = len(metrics_list)
-        except Exception:
-            total_lines = 0
-        logger.info(f"Processing input file {url_file} with {total_lines} lines")
+        logger.info(f"Processing {len(metrics_list)} records from {url_file}")
 
-        # Prepare output
-        use_stdout = not args.output
-        if use_stdout:
-            out_fp = sys.stdout
-        else:
-            out_fp = open(args.output, "w", encoding="utf-8")
-
-        # Legacy analyze_repo usage removed: url_handler is now the single
-        # authoritative source for per-line metrics. We no longer spawn
-        # analyze_repo subprocesses or merge their results here.
+        # Process each record
         models_out = []
         for idx, rec in enumerate(metrics_list):
-            # Determine corresponding triple (code,dataset,model)
             triple = triples[idx] if idx < len(triples) else ("", "", "")
             code_url, dataset_url, model_url = triple
 
-            # No merged analysis from external subprocesses; `rec` must
-            # contain the metrics (url_handler.handle_input_file is trusted).
-            merged_analysis: dict = {}
-
-            # Per-line info: emit a short summary at INFO level
-            try:
-                line_name = rec.get('name') or (model_url or code_url or dataset_url) or ''
-                logger.info(f"Line {idx+1}/{len(metrics_list)}: name={line_name} model_url={model_url or '-'} dataset_url={dataset_url or '-'} code_url={code_url or '-'}")
-            except Exception:
-                pass
-
-            # intermediate debugging removed for presentation
-
-            # Build a canonical record with all required fields
+            # Extract values with proper defaults
             def _get_num(key, default=0.0):
-                v = rec.get(key, merged_analysis.get(key))
+                v = rec.get(key)
                 try:
                     return float(v) if v is not None else float(default)
                 except Exception:
                     return float(default)
 
             def _get_int(key, default=0):
-                v = rec.get(key, merged_analysis.get(key))
+                v = rec.get(key)
                 try:
                     return int(v) if v is not None else int(default)
                 except Exception:
                     return int(default)
 
-            name = rec.get("name") or (model_url or code_url or dataset_url) or ""
+            name = rec.get("name") or model_url or ""
             category = rec.get("category") or "MODEL"
 
-            # NetScore will be computed after we extract all component values
-            # (license_score, size_score, ramp_up_time, bus_factor, etc.).
-            net_score = 0.0
-            net_score_latency = 0
-
+            # Extract all component scores
             ramp_up_time = _get_num("ramp_up_time", 0.0)
             ramp_up_time_latency = _get_int("ramp_up_time_latency", 0)
             bus_factor = _get_num("bus_factor", 0.0)
             bus_factor_latency = _get_int("bus_factor_latency", 0)
-
             performance_claims = _get_num("performance_claims", 0.0)
             performance_claims_latency = _get_int("performance_claims_latency", 0)
-
-            license_str = merged_analysis.get("license") or rec.get("license") or "Unknown"
-            try:
-                low = str(license_str).lower()
-                if "mit" in low or "bsd" in low or "apache" in low:
-                    license_score = 1.0
-                elif "gpl" in low or "lgpl" in low:
-                    license_score = 0.0
-                else:
-                    license_score = 0.5
-            except Exception:
-                license_score = 0.0
+            dataset_and_code_score = _get_num("dataset_and_code_score", 0.0)
+            dataset_and_code_score_latency = _get_int("dataset_and_code_score_latency", 0)
+            dataset_quality = _get_num("dataset_quality", 0.0)
+            dataset_quality_latency = _get_int("dataset_quality_latency", 0)
+            code_quality = _get_num("code_quality", 0.0)
+            code_quality_latency = _get_int("code_quality_latency", 0)
+            
+            # License score (this should be from url_handler)
+            license_score = _get_num("license", 0.0)
             license_latency = _get_int("license_latency", 0)
-
-            # Prefer the new `size_score` field (from url_handler).
-            # The legacy 'size' key and merged_analysis fallback are no longer needed.
-
+            
+            # Size score
             size_score = rec.get("size_score")
             if not isinstance(size_score, dict):
                 size_score = {
-                    "raspberry_pi": float(merged_analysis.get("raspberry_pi", 0.0) or 0.0),
-                    "jetson_nano": float(merged_analysis.get("jetson_nano", 0.0) or 0.0),
-                    "desktop_pc": float(merged_analysis.get("desktop_pc", 0.0) or 0.0),
-                    "aws_server": float(merged_analysis.get("aws_server", 0.0) or 0.0),
+                    "raspberry_pi": 0.0,
+                    "jetson_nano": 0.0,
+                    "desktop_pc": 0.0,
+                    "aws_server": 0.0,
                 }
-            # size_score_latency may be reported under several keys; try them
+            else:
+                # Ensure all keys exist and are floats
+                for device in ["raspberry_pi", "jetson_nano", "desktop_pc", "aws_server"]:
+                    size_score[device] = float(size_score.get(device, 0.0))
+            
             size_score_latency = _get_int("size_score_latency", 0)
 
-            dataset_and_code_score = _get_num("dataset_and_code_score", 0.0)
-            dataset_and_code_score_latency = _get_int("dataset_and_code_score_latency", 0)
-
-            dataset_quality = _get_num("dataset_quality", 0.0)
-            dataset_quality_latency = _get_int("dataset_quality_latency", 0)
-
-            code_quality = _get_num("code_quality", 0.0)
-            code_quality_latency = _get_int("code_quality_latency", 0)
-
-            # Compute NetScore now that component values are available.
+            # Calculate NetScore: license as multiplier, not component
             try:
                 start_net = time.perf_counter()
-                # derive scalar size from size_score dict
-                size_scalar2 = 0.0
-                if isinstance(size_score, dict) and size_score:
-                    try:
-                        vals2 = [float(v or 0.0) for v in size_score.values()]
-                        size_scalar2 = sum(vals2) / len(vals2) if vals2 else 0.0
-                    except Exception:
-                        size_scalar2 = 0.0
-
-                # Weighted sum where weights sum to 1.0.
-                # Include license_score as a component rather than a multiplier.
-                comp2 = (
-                    0.12 * float(size_scalar2)
-                    + 0.12 * float(ramp_up_time)
-                    + 0.12 * float(bus_factor)
-                    + 0.12 * float(dataset_and_code_score)
-                    + 0.12 * float(dataset_quality)
-                    + 0.12 * float(code_quality)
-                    + 0.16 * float(performance_claims)
-                    + 0.12 * float(license_score)
+                
+                # Average size score across devices
+                size_scalar = sum(size_score.values()) / len(size_score) if size_score else 0.0
+                
+                # Weighted sum of components (weights sum to 1.0)
+                components_score = (
+                    0.18 * float(size_scalar) +
+                    0.12 * float(ramp_up_time) +
+                    0.12 * float(bus_factor) +
+                    0.18 * float(dataset_and_code_score) +
+                    0.12 * float(dataset_quality) +
+                    0.12 * float(code_quality) +
+                    0.16 * float(performance_claims)
                 )
-                net_score = float(comp2)
+                
+                # Apply license as multiplier
+                net_score = float(license_score) * float(components_score)
                 net_score = max(0.0, min(1.0, net_score))
                 net_score_latency = int(round((time.perf_counter() - start_net) * 1000))
-            except Exception:
+            except Exception as e:
+                logger.error(f"NetScore calculation failed: {e}")
                 net_score = 0.0
                 net_score_latency = 0
 
@@ -431,256 +332,38 @@ def main(argv: Iterable[str] | None = None) -> int:
 
             models_out.append(final)
 
-    # Emit NDJSON: one JSON object per model (model URLs only).
-        # We assume `triples` aligns with `metrics_list` (same indices).
+        # Output NDJSON for models only
+        use_stdout = not args.output
+        if use_stdout:
+            out_fp = sys.stdout
+        else:
+            out_fp = open(args.output, "w", encoding="utf-8")
+
         emitted = 0
         for idx, final in enumerate(models_out):
-            # Determine if this record corresponds to a model URL
-            triple_for_rec = triples[idx] if idx < len(triples) else ("", "", "")
-            code_triple_url, dataset_triple_url, model_triple_url = triple_for_rec
-            category_val = (final.get("category") or "").upper()
-            is_model = bool(model_triple_url) or (category_val == "MODEL")
-            if not is_model:
-                # skip non-model records
-                continue
-
-            if args.pretty:
-                out_fp.write(json.dumps(final, ensure_ascii=False, indent=2))
-                out_fp.write("\n")
-            else:
-                out_fp.write(json.dumps(final, ensure_ascii=False))
-                out_fp.write("\n")
-            emitted += 1
+            # Check if this is a model URL
+            triple = triples[idx] if idx < len(triples) else ("", "", "")
+            code_url, dataset_url, model_url = triple
+            
+            # Only emit if it's a model
+            if model_url or final.get("category", "").upper() == "MODEL":
+                if args.pretty:
+                    out_fp.write(json.dumps(final, ensure_ascii=False, indent=2))
+                    out_fp.write("\n")
+                else:
+                    out_fp.write(json.dumps(final, ensure_ascii=False))
+                    out_fp.write("\n")
+                emitted += 1
 
         if not use_stdout:
             out_fp.close()
 
-        logger.info(f"Finished processing {url_file}: emitted {emitted} model records")
-
+        logger.info(f"Emitted {emitted} model records")
         return 0
 
-    # Otherwise attempt to autodispatch the single URL.
-    repo_url = args.command
-    parsed = urlparse.urlparse(repo_url)
-    netloc = (parsed.netloc or "").lower()
-    path_parts = [p for p in (parsed.path or "").split("/") if p]
-
-    # Helper to write a single NDJSON record to a file-like object
-    def write_ndjson_fp(fp, obj: dict, pretty: bool = False) -> None:
-        if pretty:
-            fp.write(json.dumps(obj, ensure_ascii=False, indent=2))
-            fp.write("\n\n")
-        else:
-            fp.write(json.dumps(obj, ensure_ascii=False))
-            fp.write("\n")
-
-    # For any single URL, call both analyzers (repo and HF) and combine.
-    # Prepare output file/stream
-    use_stdout = not args.output
-    if use_stdout:
-        out_fp = sys.stdout
-    else:
-        out_fp = open(args.output, "w", encoding="utf-8")
-
-    # For single-URL mode we delegate to url_handler to compute all metrics
-    # so we don't duplicate logic between modules. Create a temporary
-    # one-line file containing repo_url and call handle_input_file() to get
-    # the canonical record(s).
-    try:
-        try:
-            uh = importlib.import_module("src.url_handler")
-        except Exception:
-            try:
-                uh = importlib.import_module("url_handler")
-            except Exception:
-                # fallback to loading by file path
-                import importlib.util
-
-                uh_path = os.path.join(ROOT, "src", "url_handler.py")
-                spec = importlib.util.spec_from_file_location("url_handler", uh_path)
-                if spec and spec.loader:
-                    uh = importlib.util.module_from_spec(spec)
-                    src_dir = os.path.join(ROOT, "src")
-                    added = False
-                    try:
-                        if src_dir not in sys.path:
-                            sys.path.insert(0, src_dir)
-                            added = True
-                        spec.loader.exec_module(uh)
-                    finally:
-                        if added:
-                            try:
-                                sys.path.remove(src_dir)
-                            except Exception:
-                                pass
-                else:
-                    raise ImportError("cannot load url_handler module")
-    except Exception as e:
-        print("Failed importing url_handler for single-URL mode:", e, file=sys.stderr)
-        logger.error(f"Failed importing url_handler: {e}")
-        return 3
-
-    # Create a temporary file with a single triple and call handle_input_file
-    tmp = None
-    try:
-        tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8")
-        # write as code,dataset,model (we place the repo_url in the model column)
-        tmp.write(f",,{repo_url}\n")
-        tmp.close()
-        recs = uh.handle_input_file(tmp.name) or []
-        try:
-            logger.debug("url_handler single-URL output: %s", json.dumps(recs, ensure_ascii=False))
-        except Exception:
-            logger.debug("url_handler single-URL output non-serializable")
-        if not recs:
-            print(json.dumps({"error": "no data returned from url_handler"}))
-            return 1
-        # write each returned record as NDJSON (they should already follow the
-        # canonical field set from url_handler)
-        for r in recs:
-            write_ndjson_fp(out_fp, r, pretty=args.pretty)
-    finally:
-        try:
-            if tmp is not None:
-                os.unlink(tmp.name)
-        except Exception:
-            pass
-        if not use_stdout:
-            out_fp.close()
-    return 0
-
-    # GitHub repositories -> call the collector (repo analysis)
-    if "github.com" in netloc or repo_url.endswith('.git'):
-        # Inline the collector behavior to avoid subprocess calls. This
-        # collects a single repo into NDJSON using the same helpers as
-        # the previous `src/collect_ndjson.py`.
-        def read_lines_file(path: str) -> List[str]:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = []
-                for line in f:
-                    s = line.strip()
-                    if not s or s.startswith("#"):
-                        continue
-                    lines.append(s)
-                return lines
-
-        def write_ndjson_line(fp, obj: dict, pretty: bool = False) -> None:
-            if pretty:
-                fp.write(
-                    json.dumps(
-                        obj, ensure_ascii=False, indent=2, sort_keys=False
-                    )
-                )
-                fp.write("\n\n")
-            else:
-                fp.write(json.dumps(obj, ensure_ascii=False))
-                fp.write("\n")
-
-        def collect_and_write(
-            repos, models, output, append=False, pretty=False
-        ):
-            mode = "a" if append else "w"
-            written = 0
-            start_ts = _time.time()
-            use_stdout2 = output is None or output == "-"
-            if use_stdout2:
-                out = sys.stdout
-            else:
-                assert isinstance(output, str)
-                out = open(output, mode, encoding="utf-8")
-            try:
-                # lazy import sibling modules
-                mod_an = None
-                mod_hf = None
-                try:
-                    mod_an = importlib.import_module("src.analyze_repo")
-                except Exception:
-                    try:
-                        mod_an = importlib.import_module("analyze_repo")
-                    except Exception:
-                        mod_an = None
-                try:
-                    mod_hf = importlib.import_module("src.HF_API_Integration")
-                except Exception:
-                    try:
-                        mod_hf = importlib.import_module("HF_API_Integration")
-                    except Exception:
-                        mod_hf = None
-
-                for repo in repos:
-                    try:
-                        if (
-                            mod_an is not None
-                            and hasattr(mod_an, "analyze_repo")
-                        ):
-                            data = mod_an.analyze_repo(repo)
-                        else:
-                            data = {"error": "analyze_repo not available"}
-                    except Exception as e:
-                        data = {"error": str(e)}
-                    obj = {
-                        "type": "repo",
-                        "source": repo,
-                        "collected_at": time.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                        ),
-                        "data": data,
-                    }
-                    write_ndjson_line(out, obj, pretty=pretty)
-                    written += 1
-
-                for model in models:
-                    try:
-                        if (
-                            mod_hf is not None
-                            and hasattr(
-                                mod_hf, "get_huggingface_model_metadata"
-                            )
-                        ):
-                            data = (
-                                mod_hf.get_huggingface_model_metadata(model)
-                            )
-                        else:
-                            data = {
-                                "error": "HF API integration not available"
-                            }
-                    except Exception as e:
-                        data = {"error": str(e)}
-                    obj = {
-                        "type": "hf_model",
-                        "source": model,
-                        "collected_at": time.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                        ),
-                        "data": data,
-                    }
-                    write_ndjson_line(out, obj, pretty=pretty)
-                    written += 1
-
-            finally:
-                if not use_stdout2:
-                    out.close()
-            elapsed = _time.time() - start_ts
-            print(
-                f"Wrote {written} records to {output or 'stdout'} "
-                f"in {elapsed:.2f}s",
-                file=sys.stderr,
-            )
-            return 0
-
-        # call the inline collector for a single repo
-        return collect_and_write(
-            [repo_url], [], args.output or None,
-            append=False, pretty=args.pretty,
-        )
-
-    # Unknown host: attempt collector as a last resort
-    # Unknown host: attempt the inline collector as a last resort
-    return collect_and_write(
-        [repo_url], [], args.output or None,
-        append=False, pretty=args.pretty,
-    )
-
+    # Single URL mode (not a file)
+    print(f"Error: File not found: {args.command}", file=sys.stderr)
+    return 1
 
 if __name__ == "__main__":
     raise SystemExit(main())
