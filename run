@@ -152,29 +152,28 @@ def main(argv: Iterable[str] | None = None) -> int:
     
     # Setup logging
     if LOG_FILE:
-        # Ensure directory exists
-        log_dir = os.path.dirname(LOG_FILE)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        
+        # Only allow writing to an existing file path. Do not create directories or files.
+        if not os.path.exists(LOG_FILE) or not os.path.isfile(LOG_FILE):
+            print(f"Log file does not exist: {LOG_FILE}", file=sys.stderr)
+            return 4
+
         if LOG_LEVEL == 0:
-            # Create empty file for silent mode
-            open(LOG_FILE, 'w').close()
-            # Set up null handler for logger
+            # Silent mode: keep the existing file untouched, use NullHandler
             logger = logging.getLogger("run")
             logger.addHandler(logging.NullHandler())
         else:
-            # Set up actual logging
+            # Set up actual logging to the existing file (do not truncate/create)
             logger = logging.getLogger("run")
             logger.propagate = False
             logger.setLevel(logging.DEBUG)
-            
-            fh = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
+
+            # Open file in append mode to avoid truncating existing logs
+            fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
             if LOG_LEVEL == 1:
                 fh.setLevel(logging.INFO)
             else:  # LOG_LEVEL == 2
                 fh.setLevel(logging.DEBUG)
-            
+
             fmt = logging.Formatter(
                 "%(asctime)s %(levelname)s %(message)s",
                 "%Y-%m-%dT%H:%M:%SZ"
