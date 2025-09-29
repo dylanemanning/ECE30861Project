@@ -96,21 +96,36 @@ def calculate_size_metric(model_info: dict, constraints: dict = HARDWARE_CONSTRA
     if total_size == 0:
         return {**model_info, "size_metric": 0.0}
 
-    # Normalize by checking fit against each device
-    normalized_scores = []
-    for device, capacity in constraints.items():
-        ratio = total_size / capacity
-        # If it fits, score decreases the closer you are to the limit
+    # Normalize by checking fit against canonical devices so callers
+    # always receive the same device names. We map to these canonical
+    # targets: raspberry_pi, jetson_nano, desktop_pc, aws_server.
+    CANONICAL_CONSTRAINTS = {
+        "raspberry_pi": 1 * 1024**3,    # 1 GB
+        "jetson_nano": 4 * 1024**3,     # 4 GB
+        "desktop_pc": 16 * 1024**3,     # 16 GB
+        "aws_server": 32 * 1024**3,     # 32 GB
+    }
+
+    size_score = {}
+    for device, capacity in CANONICAL_CONSTRAINTS.items():
+        try:
+            ratio = float(total_size) / float(capacity) if capacity else 0.0
+        except Exception:
+            ratio = 0.0
         if ratio <= 1:
-            score = 1 - ratio  # 1 if tiny, ~0 if barely fits
+            score = max(0.0, 1.0 - ratio)
         else:
-            score = 0  # Doesn't fit at all
-        normalized_scores.append(score)
+            score = 0.0
+        size_score[device] = round(float(score), 3)
 
-    # Final score = max score across devices (best-case deployability)
-    size_metric = max(normalized_scores) if normalized_scores else 0.0
+    # Keep a scalar size_metric for backward compatibility (best-case)
+    size_metric = max(size_score.values()) if size_score else 0.0
 
-    return {**model_info, "size_metric": round(size_metric, 3)}
+    # Provide a latency field (in ms). This module does not measure remote
+    # latency directly, so set to 0. Callers may override if they measure it.
+    size_score_latency = 0
+
+    return {**model_info, "size_score": size_score, "size_score_latency": size_score_latency, "size_metric": round(size_metric, 3)}
 
 if __name__ == "__main__":
     import sys, json
