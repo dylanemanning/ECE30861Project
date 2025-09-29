@@ -289,19 +289,20 @@ def main(argv: Iterable[str] | None = None) -> int:
                 
                 # Weighted sum of components (weights sum to 1.0)
                 components_score = (
-                    0.18 * float(size_scalar) +
+                    0.12 * float(size_scalar) +
                     0.12 * float(ramp_up_time) +
                     0.12 * float(bus_factor) +
-                    0.18 * float(dataset_and_code_score) +
+                    0.12 * float(dataset_and_code_score) +
                     0.12 * float(dataset_quality) +
                     0.12 * float(code_quality) +
-                    0.16 * float(performance_claims)
+                    0.16 * float(performance_claims) +
+                    0.12 * float(license_score)
                 )
                 
                 # Apply license as multiplier
-                net_score = float(license_score) * float(components_score)
+                net_score = float(components_score)
                 net_score = max(0.0, min(1.0, net_score))
-                net_score_latency = int(round((time.perf_counter() - start_net) * 1000))
+                net_score_latency = int(rec.get("metrics_collection_latency", 0))
             except Exception as e:
                 logger.error(f"NetScore calculation failed: {e}")
                 net_score = 0.0

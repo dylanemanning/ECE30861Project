@@ -129,6 +129,8 @@ def handle_input_file(path: str) -> List[Dict[str, Any]]:
         return s
 
     for code_url, dataset_url, model_url in triples:
+        # start overall metrics collection timer for this triple (before any work)
+        metrics_collection_start = time.perf_counter()
         code_url = code_url.strip() if code_url else ""
         dataset_url = dataset_url.strip() if dataset_url else ""
         model_url = model_url.strip() if model_url else ""
@@ -313,6 +315,16 @@ def handle_input_file(path: str) -> List[Dict[str, Any]]:
                     rec[k] = v
             else:
                 rec[k] = v
+        # metrics_collection_latency (ms)
+        try:
+            elapsed = time.perf_counter() - metrics_collection_start
+            ms = int(round(elapsed * 1000))
+            if elapsed > 0 and ms == 0:
+                ms = 1
+            rec["metrics_collection_latency"] = ms
+        except Exception:
+            rec["metrics_collection_latency"] = 0
+
         results.append(rec)
     return results
 
