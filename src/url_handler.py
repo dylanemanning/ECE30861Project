@@ -4,17 +4,6 @@ import os
 import json
 import re
 import requests
-<<<<<<< HEAD
-import sys
-import os
-# Ensure src is in sys.path for imports
-SRC_DIR = os.path.dirname(os.path.abspath(__file__))
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
-import HF_API_Integration as hf
-import genai_readme_analysis
-from genai_readme_analysis import analyze_metrics, discover_dataset_url_with_genai
-=======
 import importlib
 
 # Robust import for HF_API_Integration: try package import, then top-level, then relative.
@@ -58,7 +47,6 @@ if gra is None:
 else:
     analyze_metrics = getattr(gra, "analyze_metrics")
     discover_dataset_url_with_genai = getattr(gra, "discover_dataset_url_with_genai")
->>>>>>> ce17111e561f80f8ca8f87ed48f22c395d41f875
 
 
 def parse_triple(line: str) -> Tuple[str, str, str]:
