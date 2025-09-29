@@ -1,5 +1,11 @@
 import requests
 
+HARDWARE_CONSTRAINTS = {
+    "aws_t2_micro": 1 * 1024**3,    # 1 GB
+    "aws_t2_large": 8 * 1024**3,    # 8 GB
+    "aws_p3_2xlarge": 16 * 1024**3, # 16 GB
+    "local_gpu": 12 * 1024**3       # 12 GB VRAM
+}
 
 def get_model_file_sizes(model_id: str) -> dict:
     """
