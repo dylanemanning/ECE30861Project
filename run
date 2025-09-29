@@ -159,7 +159,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     # Read LOG_FILE and LOG_LEVEL from environment safely. Defaults:
     #   LOG_FILE -> last_run.log
     #   LOG_LEVEL -> 0 (silent). Allowed values: 0,1,2
-    LOG_FILE = os.environ.get("LOG_FILE", "./last_run.log")
+    LOG_FILE = os.environ.get("LOG_FILE", "last_run.log")
     try:
         LOG_LEVEL = int(os.environ.get("LOG_LEVEL", "0"))
     except Exception:
@@ -183,7 +183,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         except Exception:
             pass
         try:
-            fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+            fh = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
         except Exception:
             fh = None
         if fh:
@@ -387,16 +387,19 @@ def main(argv: Iterable[str] | None = None) -> int:
                     except Exception:
                         size_scalar2 = 0.0
 
+                # Weighted sum where weights sum to 1.0.
+                # Include license_score as a component rather than a multiplier.
                 comp2 = (
-                    0.18 * float(size_scalar2)
+                    0.12 * float(size_scalar2)
                     + 0.12 * float(ramp_up_time)
                     + 0.12 * float(bus_factor)
-                    + 0.18 * float(dataset_and_code_score)
+                    + 0.12 * float(dataset_and_code_score)
                     + 0.12 * float(dataset_quality)
                     + 0.12 * float(code_quality)
                     + 0.16 * float(performance_claims)
+                    + 0.12 * float(license_score)
                 )
-                net_score = float(license_score) * float(comp2)
+                net_score = float(comp2)
                 net_score = max(0.0, min(1.0, net_score))
                 net_score_latency = int(round((time.perf_counter() - start_net) * 1000))
             except Exception:
