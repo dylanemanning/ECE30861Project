@@ -22,6 +22,7 @@ import urllib.parse as urlparse
 import importlib
 import tempfile
 import shutil
+import logging
 # (List imported above) use 'time' directly for all timing
 
 
@@ -154,6 +155,39 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    # Configure logging to file per environment variables
+    LOG_FILE = os.environ.get("LOG_FILE", "last_run.log")
+    try:
+        LOG_LEVEL = int(os.environ.get("LOG_LEVEL", "0"))
+    except Exception:
+        LOG_LEVEL = 0
+
+    logger = logging.getLogger("run")
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+    # Ensure a handler exists; if LOG_FILE provided, write there; otherwise NullHandler
+    if LOG_FILE:
+        try:
+            os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
+        except Exception:
+            pass
+        try:
+            fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+        except Exception:
+            fh = None
+        if fh:
+            if LOG_LEVEL == 0:
+                fh.setLevel(100)
+            elif LOG_LEVEL == 1:
+                fh.setLevel(logging.INFO)
+            else:
+                fh.setLevel(logging.DEBUG)
+            fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%SZ")
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+    else:
+        logger.addHandler(logging.NullHandler())
+
     if not args.command:
         parser.print_help()
         return 2
@@ -199,12 +233,14 @@ def main(argv: Iterable[str] | None = None) -> int:
                         raise ImportError("cannot load url_handler module")
         except Exception as e:
             print("Failed importing url_handler:", e, file=sys.stderr)
+            logger.error(f"Failed importing url_handler: {e}")
             return 3
 
         try:
             metrics_list = uh.handle_input_file(url_file) or []
         except Exception as e:
             print("url_handler.handle_input_file failed:", e, file=sys.stderr)
+            logger.warning(f"url_handler.handle_input_file failed: {e}")
             # fallback: synthesize empty records matching the number of triples
             try:
                 triples_fallback = uh.read_url_file(url_file)
@@ -219,6 +255,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             triples = uh.read_url_file(url_file)
         except Exception:
             triples = []
+
+        # Informational log: start processing
+        try:
+            total_lines = len(metrics_list)
+        except Exception:
+            total_lines = 0
+        logger.info(f"Processing input file {url_file} with {total_lines} lines")
 
         # Prepare output
         use_stdout = not args.output
@@ -290,10 +333,16 @@ def main(argv: Iterable[str] | None = None) -> int:
                         cmd, capture_output=True, text=True, timeout=timeout_sec
                     )
                     if proc.returncode != 0:
+                        logger.debug(
+                            f"analyze_repo subprocess failed for {url_to_analyze} rc={proc.returncode} stderr={proc.stderr!r}"
+                        )
                         # Subprocess failed; return empty analysis
                         return {}
                     out = proc.stdout.strip()
                     if not out:
+                        logger.debug(
+                            f"analyze_repo subprocess produced no output for {url_to_analyze}"
+                        )
                         return {}
                     try:
                         return json.loads(out)
@@ -309,11 +358,14 @@ def main(argv: Iterable[str] | None = None) -> int:
                                 return json.loads(candidate)
                         except Exception:
                             pass
+                        logger.debug(f"analyze_repo subprocess returned non-json output for {url_to_analyze}")
                         return {}
                 except subprocess.TimeoutExpired:
+                    logger.debug(f"analyze_repo subprocess timed out for {url_to_analyze} after {timeout_sec}s")
                     # timed out: return empty analysis
                     return {}
                 except Exception:
+                    logger.debug(f"analyze_repo subprocess exception for {url_to_analyze}")
                     return {}
 
             # Try analyze_repo on each non-empty URL (code first, then model, then dataset)
@@ -444,7 +496,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
             models_out.append(final)
 
-        # Emit NDJSON: one JSON object per model (model URLs only).
+    # Emit NDJSON: one JSON object per model (model URLs only).
         # We assume `triples` aligns with `metrics_list` (same indices).
         emitted = 0
         for idx, final in enumerate(models_out):
@@ -467,6 +519,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         if not use_stdout:
             out_fp.close()
+
+        logger.info(f"Finished processing {url_file}: emitted {emitted} model records")
 
         return 0
 

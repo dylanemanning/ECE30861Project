@@ -1,5 +1,11 @@
 import requests
 
+HARDWARE_CONSTRAINTS = {
+    "aws_t2_micro": 1 * 1024**3,    # 1 GB
+    "aws_t2_large": 8 * 1024**3,    # 8 GB
+    "aws_p3_2xlarge": 16 * 1024**3, # 16 GB
+    "local_gpu": 12 * 1024**3       # 12 GB VRAM
+}
 
 def get_model_file_sizes(model_id: str) -> dict:
     """
@@ -78,6 +84,33 @@ def get_model_file_sizes(model_id: str) -> dict:
     except Exception as e:
         return {"model_id": model_id, "error": str(e)}
 
+def calculate_size_metric(model_info: dict, constraints: dict = HARDWARE_CONSTRAINTS) -> dict:
+    """
+    Given model_info (from get_model_file_sizes), compute a normalized size metric.
+    Metric = min(normalized ratios across devices), where 1 = fits perfectly, 0 = does not fit anywhere.
+    """
+    if "error" in model_info:
+        return {**model_info, "size_metric": 0.0}
+
+    total_size = model_info.get("total_size_bytes", 0)
+    if total_size == 0:
+        return {**model_info, "size_metric": 0.0}
+
+    # Normalize by checking fit against each device
+    normalized_scores = []
+    for device, capacity in constraints.items():
+        ratio = total_size / capacity
+        # If it fits, score decreases the closer you are to the limit
+        if ratio <= 1:
+            score = 1 - ratio  # 1 if tiny, ~0 if barely fits
+        else:
+            score = 0  # Doesn't fit at all
+        normalized_scores.append(score)
+
+    # Final score = max score across devices (best-case deployability)
+    size_metric = max(normalized_scores) if normalized_scores else 0.0
+
+    return {**model_info, "size_metric": round(size_metric, 3)}
 
 if __name__ == "__main__":
     import sys, json
