@@ -5,13 +5,6 @@ import shutil
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 
-# Import the functions we're testing
-from ECE30861Project_Ava.analyze_repo import (
-    clone_repo,
-    extract_license,
-    extract_repo_stats,
-    analyze_repo
-)
 
 
 class TestAnalyzeRepo:
