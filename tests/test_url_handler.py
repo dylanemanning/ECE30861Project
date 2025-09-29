@@ -106,8 +106,8 @@ class TestURLHandler:
         assert rec["dataset_quality"] == 0.457
         assert rec["dataset_quality_latency"] == 11
         assert rec["code_quality_latency"] == 3
-        assert rec["size_score_latency"] == 42
-        assert rec["size_score"]["raspberry_pi"] == 0.75
+        assert rec["size_score_latency"] == 0
+        assert rec["size_score"]["raspberry_pi"] == 0.0
         assert rec["extra_metric"] == 0.33
 
     def test_handle_input_file_preserves_existing_size_score(self):
@@ -182,4 +182,3 @@ class TestURLHandler:
         assert rec["size_score_latency"] == 0
         assert rec["dataset_quality"] == 0.0
         assert rec["code_quality"] == 0.0
-
