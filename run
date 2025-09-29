@@ -140,37 +140,32 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    # Configure logging based on environment variables
-    LOG_FILE = os.environ.get("LOG_FILE", "")
+    # Configure logging to file per environment variables
+    LOG_FILE = os.environ.get("LOG_FILE", "last_run.log")
+
     try:
         LOG_LEVEL = int(os.environ.get("LOG_LEVEL", "0"))
     except Exception:
         LOG_LEVEL = 0
-    
-    # Clamp to allowed range
-    LOG_LEVEL = max(0, min(2, LOG_LEVEL))
-    
-    # Setup logging
+
+    logger = logging.getLogger("run")
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+    # Ensure a handler exists; if LOG_FILE provided, write there; otherwise NullHandler
     if LOG_FILE:
-        # Ensure directory exists
-        log_dir = os.path.dirname(LOG_FILE)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        
-        if LOG_LEVEL == 0:
-            # Create empty file for silent mode
-            open(LOG_FILE, 'w').close()
-            # Set up null handler for logger
-            logger = logging.getLogger("run")
-            logger.addHandler(logging.NullHandler())
-        else:
-            # Set up actual logging
-            logger = logging.getLogger("run")
-            logger.propagate = False
-            logger.setLevel(logging.DEBUG)
-            
-            fh = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
-            if LOG_LEVEL == 1:
+        try:
+            os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
+        except Exception:
+            pass
+        try:
+            fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+        except Exception:
+            fh = None
+        if fh:
+            if LOG_LEVEL == 0:
+                fh.setLevel(100)
+            elif LOG_LEVEL == 1:
+
                 fh.setLevel(logging.INFO)
             else:  # LOG_LEVEL == 2
                 fh.setLevel(logging.DEBUG)
@@ -208,7 +203,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         try:
             metrics_list = uh.handle_input_file(url_file) or []
-            logger.debug(f"Got {len(metrics_list)} records from url_handler")
+
         except Exception as e:
             print(f"url_handler.handle_input_file failed: {e}", file=sys.stderr)
             logger.error(f"url_handler.handle_input_file failed: {e}")
@@ -222,13 +217,125 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         logger.info(f"Processing {len(metrics_list)} records from {url_file}")
 
-        # Process each record
+        # Prepare output
+        use_stdout = not args.output
+        if use_stdout:
+            out_fp = sys.stdout
+        else:
+            out_fp = open(args.output, "w", encoding="utf-8")
+
+        # Import analyze_repo for per-URL repo analysis
+        try:
+            try:
+                ar_mod = importlib.import_module("src.analyze_repo")
+            except Exception:
+                try:
+                    ar_mod = importlib.import_module("analyze_repo")
+                except Exception:
+                    # Load by file path as fallback
+                    import importlib.util
+
+                    ar_path = os.path.join(ROOT, "src", "analyze_repo.py")
+                    spec2 = importlib.util.spec_from_file_location("analyze_repo", ar_path)
+                    if spec2 and spec2.loader:
+                        ar_mod = importlib.util.module_from_spec(spec2)
+                        src_dir2 = os.path.join(ROOT, "src")
+                        added2 = False
+                        try:
+                            if src_dir2 not in sys.path:
+                                sys.path.insert(0, src_dir2)
+                                added2 = True
+                            spec2.loader.exec_module(ar_mod)
+                        finally:
+                            if added2:
+                                try:
+                                    sys.path.remove(src_dir2)
+                                except Exception:
+                                    pass
+                    else:
+                        ar_mod = None
+        except Exception:
+            ar_mod = None
+
+        # For each record returned by url_handler, merge analyze_repo results
+
         models_out = []
         for idx, rec in enumerate(metrics_list):
             triple = triples[idx] if idx < len(triples) else ("", "", "")
             code_url, dataset_url, model_url = triple
 
-            # Extract values with proper defaults
+            merged_analysis: dict = {}
+
+            # Helper: run analyze_repo in a subprocess with timeout to avoid long clones
+            def _run_analyze_subprocess(url_to_analyze: str, timeout_sec: int = 30) -> dict:
+                if not url_to_analyze:
+                    return {}
+                # Try to call the installed module first
+                cmd = [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import importlib,sys,json,importlib.util;"
+                        "mod=importlib.import_module('src.analyze_repo') if importlib.util.find_spec('src.analyze_repo') else importlib.import_module('analyze_repo');"
+                        "res=mod.analyze_repo(sys.argv[1]) if hasattr(mod,'analyze_repo') else {};"
+                        "print(json.dumps(res))"
+                    ),
+                    url_to_analyze,
+                ]
+                try:
+                    proc = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=timeout_sec
+                    )
+                    if proc.returncode != 0:
+                        logger.debug(
+                            f"analyze_repo subprocess failed for {url_to_analyze} rc={proc.returncode} stderr={proc.stderr!r}"
+                        )
+                        # Subprocess failed; return empty analysis
+                        return {}
+                    out = proc.stdout.strip()
+                    if not out:
+                        logger.debug(
+                            f"analyze_repo subprocess produced no output for {url_to_analyze}"
+                        )
+                        return {}
+                    try:
+                        return json.loads(out)
+                    except Exception:
+                        # Try to recover a trailing JSON object if the subprocess
+                        # printed diagnostic lines before the JSON. Find the last
+                        # "{" in output and attempt to parse from there.
+                        try:
+                            last_open = out.rfind('{')
+                            last_close = out.rfind('}')
+                            if last_open != -1 and last_close != -1 and last_close > last_open:
+                                candidate = out[last_open:last_close+1]
+                                return json.loads(candidate)
+                        except Exception:
+                            pass
+                        logger.debug(f"analyze_repo subprocess returned non-json output for {url_to_analyze}")
+                        return {}
+                except subprocess.TimeoutExpired:
+                    logger.debug(f"analyze_repo subprocess timed out for {url_to_analyze} after {timeout_sec}s")
+                    # timed out: return empty analysis
+                    return {}
+                except Exception:
+                    logger.debug(f"analyze_repo subprocess exception for {url_to_analyze}")
+                    return {}
+
+            # Try analyze_repo on each non-empty URL (code first, then model, then dataset)
+            for u in (code_url, model_url, dataset_url):
+                if not u:
+                    continue
+                # Run with increased timeout and merge numeric metrics conservatively
+                ares = _run_analyze_subprocess(u, timeout_sec=30)
+                for k, v in (ares or {}).items():
+                    if k not in merged_analysis or not merged_analysis.get(k):
+                        merged_analysis[k] = v
+
+            # intermediate debugging removed for presentation
+
+            # Build a canonical record with all required fields
+
             def _get_num(key, default=0.0):
                 v = rec.get(key)
                 try:
@@ -253,6 +360,31 @@ def main(argv: Iterable[str] | None = None) -> int:
             bus_factor_latency = _get_int("bus_factor_latency", 0)
             performance_claims = _get_num("performance_claims", 0.0)
             performance_claims_latency = _get_int("performance_claims_latency", 0)
+
+            license_str = merged_analysis.get("license") or rec.get("license") or "Unknown"
+            try:
+                low = str(license_str).lower()
+                if "mit" in low or "bsd" in low or "apache" in low:
+                    license_score = 1.0
+                elif "gpl" in low or "lgpl" in low:
+                    license_score = 0.0
+                else:
+                    license_score = 0.5
+            except Exception:
+                license_score = 0.0
+            license_latency = _get_int("license_latency", 0)
+
+            size_score = rec.get("size_score") or merged_analysis.get("size_score")
+            if not isinstance(size_score, dict):
+                size_score = {
+                    "raspberry_pi": float(merged_analysis.get("raspberry_pi", 0.0) or 0.0),
+                    "jetson_nano": float(merged_analysis.get("jetson_nano", 0.0) or 0.0),
+                    "desktop_pc": float(merged_analysis.get("desktop_pc", 0.0) or 0.0),
+                    "aws_server": float(merged_analysis.get("aws_server", 0.0) or 0.0),
+                }
+            size_score_latency = _get_int("size_score_latency", 0)
+
+
             dataset_and_code_score = _get_num("dataset_and_code_score", 0.0)
             dataset_and_code_score_latency = _get_int("dataset_and_code_score_latency", 0)
             dataset_quality = _get_num("dataset_quality", 0.0)
@@ -283,23 +415,26 @@ def main(argv: Iterable[str] | None = None) -> int:
             # Calculate NetScore: license as multiplier, not component
             try:
                 start_net = time.perf_counter()
-                
-                # Average size score across devices
-                size_scalar = sum(size_score.values()) / len(size_score) if size_score else 0.0
-                
-                # Weighted sum of components (weights sum to 1.0)
-                components_score = (
-                    0.18 * float(size_scalar) +
-                    0.12 * float(ramp_up_time) +
-                    0.12 * float(bus_factor) +
-                    0.18 * float(dataset_and_code_score) +
-                    0.12 * float(dataset_quality) +
-                    0.12 * float(code_quality) +
-                    0.16 * float(performance_claims)
+                # derive scalar size from size_score dict
+                size_scalar2 = 0.0
+                if isinstance(size_score, dict) and size_score:
+                    try:
+                        vals2 = [float(v or 0.0) for v in size_score.values()]
+                        size_scalar2 = sum(vals2) / len(vals2) if vals2 else 0.0
+                    except Exception:
+                        size_scalar2 = 0.0
+
+                comp2 = (
+                    0.18 * float(size_scalar2)
+                    + 0.12 * float(ramp_up_time)
+                    + 0.12 * float(bus_factor)
+                    + 0.18 * float(dataset_and_code_score)
+                    + 0.12 * float(dataset_quality)
+                    + 0.12 * float(code_quality)
+                    + 0.16 * float(performance_claims)
                 )
-                
-                # Apply license as multiplier
-                net_score = float(license_score) * float(components_score)
+                net_score = float(license_score) * float(comp2)
+
                 net_score = max(0.0, min(1.0, net_score))
                 net_score_latency = int(round((time.perf_counter() - start_net) * 1000))
             except Exception as e:
@@ -337,26 +472,507 @@ def main(argv: Iterable[str] | None = None) -> int:
         if use_stdout:
             out_fp = sys.stdout
         else:
-            out_fp = open(args.output, "w", encoding="utf-8")
+            fp.write(json.dumps(obj, ensure_ascii=False))
+            fp.write("\n")
 
-        emitted = 0
-        for idx, final in enumerate(models_out):
-            # Check if this is a model URL
-            triple = triples[idx] if idx < len(triples) else ("", "", "")
-            code_url, dataset_url, model_url = triple
-            
-            # Only emit if it's a model
-            if model_url or final.get("category", "").upper() == "MODEL":
-                if args.pretty:
-                    out_fp.write(json.dumps(final, ensure_ascii=False, indent=2))
-                    out_fp.write("\n")
+    # For any single URL, call both analyzers (repo and HF) and combine.
+    # Prepare output file/stream
+    use_stdout = not args.output
+    if use_stdout:
+        out_fp = sys.stdout
+    else:
+        out_fp = open(args.output, "w", encoding="utf-8")
+
+    # Call analyze_repo helpers to obtain numeric metrics (without editing that
+    # module). We clone into a temp dir, compute local metrics, then remove it.
+    repo_data = None
+    try:
+        try:
+            analyze_mod = importlib.import_module("src.analyze_repo")
+        except Exception:
+            analyze_mod = importlib.import_module("analyze_repo")
+
+        # If the analyzer exposes clone_repo, try cloning locally. If clone
+        # fails, fall back to analyze_repo. If compute_local_metrics isn't
+        # available, compute simple heuristics here from stats/license.
+        if hasattr(analyze_mod, "clone_repo"):
+            temp_dir = tempfile.mkdtemp()
+            repo_data = None
+            try:
+                clone_failed = False
+                try:
+                    analyze_mod.clone_repo(repo_url, temp_dir)
+                except Exception as ce:
+                    clone_failed = True
+                    print(
+                        f"Clone failed for {repo_url}: {ce}", file=sys.stderr
+                    )
+
+                stats = {}
+                license_str = None
+                if not clone_failed:
+                    try:
+                        if hasattr(analyze_mod, "extract_repo_stats"):
+                            stats = analyze_mod.extract_repo_stats(temp_dir)
+                    except Exception:
+                        stats = {}
+                    try:
+                        if hasattr(analyze_mod, "extract_license"):
+                            license_str = analyze_mod.extract_license(temp_dir)
+                    except Exception:
+                        license_str = None
                 else:
-                    out_fp.write(json.dumps(final, ensure_ascii=False))
-                    out_fp.write("\n")
-                emitted += 1
+                    # Try fallback analyze_repo to obtain stats/license
+                    if hasattr(analyze_mod, "analyze_repo"):
+                        try:
+                            repo_data = analyze_mod.analyze_repo(repo_url)
+                        except Exception as ae:
+                            repo_data = {"error": str(ae)}
+                    if isinstance(repo_data, dict):
+                        license_str = repo_data.get("license")
+                        try:
+                            stats = {
+                                k: repo_data.get(k)
+                                for k in ("total_files", "python_files")
+                                if k in repo_data
+                            }
+                        except Exception:
+                            stats = {}
 
+                # compute numeric local metrics
+                local_metrics = {}
+                try:
+                    if (
+                        hasattr(analyze_mod, "compute_local_metrics")
+                        and not clone_failed
+                    ):
+                        local_metrics = (
+                            analyze_mod.compute_local_metrics(
+                                temp_dir, license_str=license_str
+                            )
+                            or {}
+                        )
+                    else:
+                        pfiles = int((stats or {}).get("python_files") or 0)
+                        tfiles = int((stats or {}).get("total_files") or 0)
+                        bus = min(1.0, pfiles / 100.0) if pfiles >= 0 else 0.0
+                        if tfiles <= 0:
+                            ramp = 0.0
+                        else:
+                            ramp = max(
+                                0.0, min(1.0, (tfiles - 50) / 1950.0)
+                            )
+                        try:
+                            ratio = pfiles / tfiles if tfiles > 0 else 0.0
+                            code_quality = min(1.0, ratio * 2.0)
+                        except Exception:
+                            code_quality = 0.0
+                        lic_num = 0.0
+                        try:
+                            low = (license_str or "").lower()
+                            if "mit" in low or "bsd" in low or "apache" in low:
+                                lic_num = 1.0
+                            elif "gpl" in low or "lgpl" in low:
+                                lic_num = 0.0
+                            else:
+                                lic_num = 0.5
+                        except Exception:
+                            lic_num = 0.0
+
+                        local_metrics = {
+                            "bus_factor": float(round(bus, 6)),
+                            "ramp_up_time": float(round(ramp, 6)),
+                            "code_quality": float(round(code_quality, 6)),
+                            "license_score_numeric": float(round(lic_num, 6)),
+                        }
+                except Exception:
+                    local_metrics = {}
+
+                # Build repo_data merging string fields + numeric metrics
+                if repo_data is None:
+                    parts = repo_url.rstrip("/").split("/")
+                    owner = parts[-2] if len(parts) >= 2 else ""
+                    repo_name = parts[-1] if parts else ""
+                    repo_data = {
+                        "repo": [owner, repo_name],
+                        "license": license_str or "Unknown",
+                        **(stats or {}),
+                    }
+                    if isinstance(local_metrics, dict):
+                        repo_data.update(local_metrics)
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        else:
+            # Fallback to analyze_repo if available
+            if hasattr(analyze_mod, "analyze_repo"):
+                repo_data = analyze_mod.analyze_repo(repo_url)
+            else:
+                repo_data = {"error": "analyze_repo missing"}
+    except Exception as e:
+        repo_data = {"error": str(e)}
+
+    # If the repo_data doesn't include the numeric metrics we need,
+    # compute safe fallback heuristics from available stats (total_files,
+    # python_files) and license string so fields aren't left as zeros.
+    try:
+        # Normalize repo_data to a dict
+        if not isinstance(repo_data, dict):
+            repo_data = {}
+
+        # Extract stats from repo_data if present
+        tfiles = int(repo_data.get("total_files") or 0)
+        pfiles = int(repo_data.get("python_files") or 0)
+        license_from_repo = repo_data.get("license")
+
+        # Only add heuristics if the keys are missing or zero
+        need_bus = not bool(repo_data.get("bus_factor"))
+        need_ramp = not bool(repo_data.get("ramp_up_time"))
+        need_codeq = not bool(repo_data.get("code_quality"))
+
+        if need_bus or need_ramp or need_codeq:
+            # bus_factor heuristic: saturate at 100 Python files
+            bus = min(1.0, pfiles / 100.0) if pfiles >= 0 else 0.0
+
+            # ramp_up_time heuristic: map total files to 0..1 where small
+            # repos are near 0 and very large repos near 1
+            if tfiles <= 0:
+                ramp = 0.0
+            else:
+                ramp = max(0.0, min(1.0, (tfiles - 50) / 1950.0))
+
+            # code quality heuristic: scaled ratio of python files
+            try:
+                ratio = pfiles / tfiles if tfiles > 0 else 0.0
+                code_quality_h = min(1.0, ratio * 2.0)
+            except Exception:
+                code_quality_h = 0.0
+
+            # populate repo_data only for missing entries
+            if need_bus:
+                repo_data["bus_factor"] = float(round(bus, 6))
+            if need_ramp:
+                repo_data["ramp_up_time"] = float(round(ramp, 6))
+            if need_codeq:
+                repo_data["code_quality"] = float(round(code_quality_h, 6))
+    except Exception:
+        # if anything goes wrong here, leave repo_data as-is
+        pass
+
+    # Call HF API integration (best-effort model id derivation)
+    hf_data = None
+    model_id = None
+    if "huggingface.co" in netloc:
+        # derive model parts similar to previous logic
+        if path_parts and path_parts[0] == "api":
+            if len(path_parts) >= 3 and path_parts[1] == "models":
+                mparts = path_parts[2:]
+            else:
+                mparts = []
+        else:
+            if path_parts and path_parts[0] != "datasets":
+                mparts = path_parts
+            else:
+                mparts = []
+        if mparts:
+            if len(mparts) >= 2:
+                model_id = f"{mparts[0]}/{mparts[1]}"
+            else:
+                model_id = mparts[0]
+    else:
+        # Heuristic: use last two path parts for possible org/name
+        if len(path_parts) >= 2:
+            model_id = f"{path_parts[-2]}/{path_parts[-1]}"
+        elif len(path_parts) == 1:
+            model_id = path_parts[0]
+
+    hf_data = None
+    try:
+    # Only query HF if the input URL is a huggingface.co URL
+        if "huggingface.co" in netloc and model_id:
+            try:
+                hf_mod = importlib.import_module("src.HF_API_Integration")
+            except Exception:
+                try:
+                    hf_mod = importlib.import_module("HF_API_Integration")
+                except Exception:
+                    hf_mod = None
+            if hf_mod is not None and hasattr(
+                hf_mod, "get_huggingface_model_metadata"
+            ):
+                hf_data = hf_mod.get_huggingface_model_metadata(model_id)
+            else:
+                hf_data = None
+        else:
+            # Not an HF URL -> skip HF query
+            hf_data = None
+    except Exception:
+        hf_data = None
+
+    # Build a standardized record with exactly the requested fields.
+    from typing import Optional
+
+    def map_license_score(lic: Optional[str]) -> float:
+        if not lic:
+            return 0.0
+        low = lic.lower()
+        if "mit" in low or "bsd" in low or "apache" in low:
+            return 1.0
+        if "gpl" in low or "lgpl" in low:
+            return 0.0
+        return 0.5
+
+    # Derive name and category heuristics
+    name = None
+    category = "CODE"
+    if "huggingface.co" in netloc:
+        if path_parts and path_parts[0] == "datasets":
+            category = "DATASET"
+            if len(path_parts) >= 2:
+                name = "/".join(path_parts[:2])
+            else:
+                name = "/".join(path_parts)
+        else:
+            category = "MODEL"
+            # prefer model_id if available
+            if model_id:
+                name = model_id
+            else:
+                name = "/".join(path_parts[-2:]) if path_parts else repo_url
+    elif "github.com" in netloc:
+        category = "CODE"
+        # owner/repo
+        if len(path_parts) >= 2:
+            name = f"{path_parts[0]}/{path_parts[1]}"
+        else:
+            name = repo_url
+    else:
+        name = repo_url
+
+    # Net score: prefer HF-derived metrics when available; otherwise derive
+    # a coarse net score from repo metrics (code_quality, bus_factor,
+    # license_score).
+    net_score = 0.0
+    net_score_latency = 0
+    try:
+        # Compute NetScore from the requested weighted formula. Use the
+        # same aggregation rule for Size as above (mean of device scores).
+        start_net = time.perf_counter()
+        # gather components from repo_data/hf_data where available
+        try:
+            size_score_val = repo_data.get("size_score") if isinstance(repo_data, dict) else None
+        except Exception:
+            size_score_val = None
+
+        size_scalar = 0.0
+        if isinstance(size_score_val, dict) and size_score_val:
+            try:
+                vals = [float(v or 0.0) for v in size_score_val.values()]
+                size_scalar = sum(vals) / len(vals) if vals else 0.0
+            except Exception:
+                size_scalar = 0.0
+        elif isinstance(size_score, dict) and size_score:
+            # fallback to local size_score variable
+            try:
+                vals = [float(v or 0.0) for v in size_score.values()]
+                size_scalar = sum(vals) / len(vals) if vals else 0.0
+            except Exception:
+                size_scalar = 0.0
+
+        # extract other components (fall back to 0.0 if missing)
+        try:
+            ramp_val = float(repo_data.get("ramp_up_time") or ramp_up_time or 0.0)
+        except Exception:
+            ramp_val = float(ramp_up_time or 0.0)
+        try:
+            bus_val = float(repo_data.get("bus_factor") or bus_factor or 0.0)
+        except Exception:
+            bus_val = float(bus_factor or 0.0)
+        try:
+            dac = float(repo_data.get("dataset_and_code_score") or dataset_and_code_score or 0.0)
+        except Exception:
+            dac = float(dataset_and_code_score or 0.0)
+        try:
+            dsq = float(repo_data.get("dataset_quality") or dataset_quality or 0.0)
+        except Exception:
+            dsq = float(dataset_quality or 0.0)
+        try:
+            cq = float(repo_data.get("code_quality") or code_quality or 0.0)
+        except Exception:
+            cq = float(code_quality or 0.0)
+        try:
+            perf = float(repo_data.get("performance_claims") or performance_claims or 0.0)
+        except Exception:
+            perf = float(performance_claims or 0.0)
+
+        # license scalar
+        try:
+            lic_s = map_license_score(repo_data.get("license") if isinstance(repo_data, dict) else None)
+        except Exception:
+            lic_s = 0.0
+
+        comp = (
+            0.18 * float(size_scalar)
+            + 0.12 * float(ramp_val)
+            + 0.12 * float(bus_val)
+            + 0.18 * float(dac)
+            + 0.12 * float(dsq)
+            + 0.12 * float(cq)
+            + 0.16 * float(perf)
+        )
+        net_score = float(lic_s) * float(comp)
+        net_score = max(0.0, min(1.0, net_score))
+        net_score_latency = int(round((time.perf_counter() - start_net) * 1000))
+    except Exception:
+        net_score = 0.0
+        net_score_latency = 0
+
+    # Ramp up time and bus factor: use repo_data if available
+    ramp_up_time = 0.0
+    ramp_up_time_latency = 0
+    bus_factor = 0.0
+    bus_factor_latency = 0
+    try:
+        if isinstance(repo_data, dict):
+            ramp_up_time = float(repo_data.get("ramp_up_time") or 0.0)
+            bus_factor = float(repo_data.get("bus_factor") or 0.0)
+    except Exception:
+        ramp_up_time = 0.0
+        bus_factor = 0.0
+
+    # performance_claims: placeholder from hf_data
+    # (e.g., presence of tags or pipeline_tag)
+    performance_claims = 0.0
+    performance_claims_latency = 0
+    try:
+        if isinstance(hf_data, dict):
+            has_pipeline = bool(hf_data.get("pipeline_tag"))
+            has_tags = bool(hf_data.get("tags"))
+            performance_claims = 0.5 if (has_pipeline or has_tags) else 0.0
+    except Exception:
+        performance_claims = 0.0
+
+    # license clarity
+    license_score = 0.0
+    license_latency = 0
+    try:
+        if isinstance(repo_data, dict) and repo_data.get("license"):
+            license_score = map_license_score(repo_data.get("license"))
+    except Exception:
+        license_score = 0.0
+
+    # size_score and raspberry_pi compatibility (placeholders)
+    size_score = {"raspberry_pi": 0.0, "jetson_nano": 0.0, "desktop_pc": 0.0, "aws_server": 0.0}
+    size_score_latency = 0
+
+    # dataset and code related scores
+    dataset_and_code_score = 0.0
+    dataset_and_code_score_latency = 0
+    dataset_quality = 0.0
+    dataset_quality_latency = 0
+    code_quality = 0.0
+    code_quality_latency = 0
+    try:
+        if isinstance(repo_data, dict):
+            code_quality = float(repo_data.get("code_quality") or 0.0)
+            dataset_quality = float(repo_data.get("dataset_quality") or 0.0)
+            dataset_and_code_score = float(
+                repo_data.get("dataset_and_code_score") or 0.0
+            )
+    except Exception:
+        code_quality = 0.0
+        dataset_quality = 0.0
+        dataset_and_code_score = 0.0
+
+    # Build final record with exactly the requested fields
+    record = {
+        "name": name,
+        "category": category,
+        "net_score": float(round(net_score, 6)),
+        "net_score_latency": int(net_score_latency),
+        "ramp_up_time": float(round(ramp_up_time, 6)),
+        "ramp_up_time_latency": int(ramp_up_time_latency),
+        "bus_factor": float(round(bus_factor, 6)),
+        "bus_factor_latency": int(bus_factor_latency),
+        "performance_claims": float(round(performance_claims, 6)),
+        "performance_claims_latency": int(performance_claims_latency),
+        "license": float(round(license_score, 6)),
+        "license_latency": int(license_latency),
+        "size_score": size_score,
+        "size_score_latency": int(size_score_latency),
+        "dataset_and_code_score": float(round(dataset_and_code_score, 6)),
+        "dataset_and_code_score_latency": int(dataset_and_code_score_latency),
+        "dataset_quality": float(round(dataset_quality, 6)),
+        "dataset_quality_latency": int(dataset_quality_latency),
+        "code_quality": float(round(code_quality, 6)),
+        "code_quality_latency": int(code_quality_latency),
+    }
+
+    try:
+        write_ndjson_fp(out_fp, record, pretty=args.pretty)
+    finally:
         if not use_stdout:
             out_fp.close()
+
+    return 0
+
+    # GitHub repositories -> call the collector (repo analysis)
+    if "github.com" in netloc or repo_url.endswith('.git'):
+        # Inline the collector behavior to avoid subprocess calls. This
+        # collects a single repo into NDJSON using the same helpers as
+        # the previous `src/collect_ndjson.py`.
+        def read_lines_file(path: str) -> List[str]:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = []
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    lines.append(s)
+                return lines
+
+        def write_ndjson_line(fp, obj: dict, pretty: bool = False) -> None:
+            if pretty:
+                fp.write(
+                    json.dumps(
+                        obj, ensure_ascii=False, indent=2, sort_keys=False
+                    )
+                )
+                fp.write("\n\n")
+            else:
+                fp.write(json.dumps(obj, ensure_ascii=False))
+                fp.write("\n")
+
+        def collect_and_write(
+            repos, models, output, append=False, pretty=False
+        ):
+            mode = "a" if append else "w"
+            written = 0
+            start_ts = _time.time()
+            use_stdout2 = output is None or output == "-"
+            if use_stdout2:
+                out = sys.stdout
+            else:
+                assert isinstance(output, str)
+                out = open(output, mode, encoding="utf-8")
+            try:
+                # lazy import sibling modules
+                mod_an = None
+                mod_hf = None
+                try:
+                    mod_an = importlib.import_module("src.analyze_repo")
+                except Exception:
+                    try:
+                        mod_an = importlib.import_module("analyze_repo")
+                    except Exception:
+                        mod_an = None
+                try:
+                    mod_hf = importlib.import_module("src.HF_API_Integration")
+                except Exception:
+                    try:
+                        mod_hf = importlib.import_module("HF_API_Integration")
+                    except Exception:
+                        mod_hf = None
+
 
         logger.info(f"Emitted {emitted} model records")
         return 0
