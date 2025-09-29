@@ -352,10 +352,10 @@ def main(argv: Iterable[str] | None = None) -> int:
                 license_score = 0.0
             license_latency = _get_int("license_latency", 0)
 
-            # Prefer the new `size_score` field (from url_handler). Fall back
-            # to the older `size` key or individual device fields in
-            # merged_analysis for backward compatibility.
-            size_score = rec.get("size_score") or rec.get("size") or merged_analysis.get("size_score")
+            # Prefer the new `size_score` field (from url_handler).
+            # The legacy 'size' key and merged_analysis fallback are no longer needed.
+
+            size_score = rec.get("size_score")
             if not isinstance(size_score, dict):
                 size_score = {
                     "raspberry_pi": float(merged_analysis.get("raspberry_pi", 0.0) or 0.0),
