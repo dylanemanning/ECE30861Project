@@ -64,3 +64,122 @@ class TestURLHandler:
     def test_handle_input_file_empty(self, mock_read):
         mock_read.return_value = []
         assert handle_input_file("empty") == []
+
+    def test_handle_input_file_uses_model_size_scalar(self):
+        triples = [("code", "https://huggingface.co/datasets/org/ds", "https://huggingface.co/owner/model")]
+        metrics = {
+            "dataset_quality": 0.4567,
+            "dataset_quality_latency": 10.7,
+            "code_quality": 0.91,
+            "code_quality_latency": 3.2,
+            "bus_factor": 0.25,
+            "bus_factor_latency": 4.4,
+            "extra_metric": 0.33,
+        }
+        with patch('src.url_handler.read_url_file', return_value=triples), \
+             patch('src.url_handler.analyze_metrics', return_value=metrics) as mock_analyze, \
+             patch('src.url_handler.hf') as mock_hf, \
+             patch('src.url_handler.time.perf_counter', side_effect=[100.0, 100.042]), \
+             patch('src.url_handler.hf_model_size') as mock_model_size:
+            mock_hf.get_license_info.return_value = {
+                "lgplv21_compat_score": 1,
+                "license_latency": 0.004,
+            }
+            mock_model_size.get_model_file_sizes.return_value = {"total_size_bytes": 400_000_000}
+            mock_model_size.calculate_size_metric.return_value = {"size_metric": 0.75}
+            mock_model_size.HARDWARE_CONSTRAINTS = {
+                "raspberry_pi": 1,
+                "jetson_nano": 2,
+                "desktop_pc": 4,
+                "aws_server": 8,
+            }
+
+            records = handle_input_file("dummy.txt")
+
+        assert mock_analyze.called
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["name"] == "model"
+        assert rec["license"] == 1
+        assert rec["license_latency"] == 4
+        assert rec["dataset_and_code_score"] == 1.0
+        assert rec["dataset_quality"] == 0.457
+        assert rec["dataset_quality_latency"] == 11
+        assert rec["code_quality_latency"] == 3
+        assert rec["size_score_latency"] == 42
+        assert rec["size_score"]["raspberry_pi"] == 0.75
+        assert rec["extra_metric"] == 0.33
+
+    def test_handle_input_file_preserves_existing_size_score(self):
+        metrics = {
+            "size_score": {
+                "raspberry_pi": 0.1,
+                "jetson_nano": 0.2,
+                "desktop_pc": 0.3,
+                "aws_server": 0.4,
+            },
+            "size_score_latency": "5.6",
+            "dataset_quality": "bad",
+            "code_quality_latency": "2.9",
+            "bus_factor_latency": "1.9",
+            "extra_latency": "7.49",
+            "raspberry_pi": 0.9,
+        }
+        with patch('src.url_handler.read_url_file', return_value=[("", "", ",bert-base")]), \
+             patch('src.url_handler.analyze_metrics', return_value=metrics), \
+             patch('src.url_handler.hf') as mock_hf, \
+             patch('src.url_handler.hf_model_size', None):
+            mock_hf.get_license_info.return_value = {
+                "lgplv21_compat_score": 0,
+                "license_latency": "NaN",
+            }
+
+            records = handle_input_file("dummy.txt")
+
+        rec = records[0]
+        assert rec["name"] == ",bert-base"
+        assert rec["license"] == 0
+        assert rec["license_latency"] == 0
+        assert rec["dataset_and_code_score"] == 0.0
+        assert rec["size_score"]["aws_server"] == 0.4
+        assert rec["size_score_latency"] == 6
+        assert rec["dataset_quality"] == "bad"
+        assert rec["extra_latency"] == 7
+        # metrics without specific keys should be carried over unchanged
+        assert rec["raspberry_pi"] == 0.9
+
+    def test_handle_input_file_derives_size_score_from_scalar(self):
+        metrics = {
+            "size_score": 0.5,
+            "raspberry_pi": "0.8",
+            "jetson_nano": None,
+            "desktop_pc": "",
+            "aws_server": 0,
+            "size_score_latency": "bad",
+            "dataset_quality": None,
+            "code_quality": None,
+            "dataset_quality_latency": None,
+            "code_quality_latency": None,
+        }
+        with patch('src.url_handler.read_url_file', return_value=[("", "", "https://huggingface.co/owner/model")]), \
+             patch('src.url_handler.analyze_metrics', return_value=metrics), \
+             patch('src.url_handler.hf') as mock_hf, \
+             patch('src.url_handler.hf_model_size', None):
+            mock_hf.get_license_info.return_value = {
+                "lgplv21_compat_score": 1,
+                "license_latency": 0,
+            }
+
+            records = handle_input_file("dummy.txt")
+
+        rec = records[0]
+        assert rec["size_score"] == {
+            "raspberry_pi": 0.8,
+            "jetson_nano": 0.0,
+            "desktop_pc": 0.0,
+            "aws_server": 0.0,
+        }
+        assert rec["size_score_latency"] == 0
+        assert rec["dataset_quality"] == 0.0
+        assert rec["code_quality"] == 0.0
+
