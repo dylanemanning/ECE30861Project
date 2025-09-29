@@ -16,7 +16,7 @@ def analyze_with_genai(readme: str = "", code: str = "", metadata: str = "", dat
 
     This call must NOT include dataset_url or dataset_and_code_score.
     """
-    api_key = os.environ.get("GEN_AI_STUDIO_API_KEY") or "sk-91a78299639b4da595d22241ca2161d0"
+    api_key = os.environ.get("GEN_AI_STUDIO_API_KEY")
     prompt = (
         "You are an expert evaluator. Return ONLY a JSON object with exactly these keys (all lower case):\n"
         "- ramp_up_time (float in [0,1])\n"
@@ -124,7 +124,7 @@ def discover_dataset_url_with_genai(readme: str = "", model: str = "") -> Dict[s
     """Ask GenAI to find the most relevant HF dataset URL from the README/model context.
     Returns { dataset_url: str, dataset_discovery_latency: int } or {} on failure.
     """
-    api_key = os.environ.get("GEN_AI_STUDIO_API_KEY") or "sk-91a78299639b4da595d22241ca2161d0"
+    api_key = os.environ.get("GEN_AI_STUDIO_API_KEY")
     prompt = (
         "You are a precise information extractor. Return ONLY a JSON object with exactly these keys:\n"
         "- dataset_url (string): The most relevant Hugging Face dataset URL in the form https://huggingface.co/datasets/<owner>/<name> extracted from the README/model context. If none is clearly indicated, return an empty string \"\".\n"
